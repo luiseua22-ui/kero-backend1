@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.49.0-focal
+FROM mcr.microsoft.com/playwright:v1.40.0-focal
 
 WORKDIR /usr/src/app
 
@@ -8,5 +8,5 @@ RUN npm install --unsafe-perm
 COPY . .
 
 EXPOSE 10000
-
 CMD ["node", "index.js"]
+
