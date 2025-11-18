@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: kero-backend
+    env: docker
+    plan: starter
+    autoDeploy: true
+    dockerfilePath: Dockerfile
+    branch: main
+    envVars:
+      - key: PLAYWRIGHT_CONCURRENCY
+        value: "2"
