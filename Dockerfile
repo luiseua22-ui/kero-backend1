@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.56.1-focal
+FROM mcr.microsoft.com/playwright:v1.49.0-focal
 
 WORKDIR /usr/src/app
 
@@ -10,4 +10,3 @@ COPY . .
 EXPOSE 10000
 
 CMD ["node", "index.js"]
-
