@@ -3,6 +3,7 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { chromium } from "playwright";
 import PQueue from "p-queue";
+import { JSDOM } from "jsdom"; // ← NECESSÁRIO PARA O /search
 
 const app = express();
 app.use(express.json());
@@ -19,7 +20,7 @@ app.use(limiter);
 // Fila para evitar excesso de browsers simultâneos
 const queue = new PQueue({ concurrency: 2 });
 
-// Função principal de scraping
+// Função principal de scraping (para URL)
 async function scrapeProduct(url) {
   return queue.add(async () => {
     const browser = await chromium.launch({
@@ -58,7 +59,85 @@ async function scrapeProduct(url) {
   });
 }
 
-// Rota principal
+// ===========================================================
+// 🚀 NOVO ENDPOINT: /search — busca real com Google Shopping
+// ===========================================================
+
+app.get("/search", async (req, res) => {
+  const q = req.query.q?.trim();
+
+  if (!q) {
+    return res.status(400).json({ error: "Parâmetro 'q' ausente" });
+  }
+
+  try {
+    // Pesquisa real no Google Shopping
+    const url =
+      "https://www.google.com/search?tbm=shop&hl=pt-BR&q=" +
+      encodeURIComponent(q);
+
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: "networkidle" });
+
+    const html = await page.content();
+    await browser.close();
+
+    const dom = new JSDOM(html);
+    const document = dom.window.document;
+
+    const items = [...document.querySelectorAll(".sh-dgr__content")]
+      .slice(0, 15) // ← garante pelo menos 15 itens
+      .map(el => {
+        const name =
+          el.querySelector(".tAxDx")?.textContent?.trim() ||
+          el.querySelector("h4")?.textContent?.trim() ||
+          null;
+
+        const price =
+          el.querySelector(".a8Pemb")?.textContent?.trim() ||
+          el.querySelector(".span")?.textContent?.trim() ||
+          null;
+
+        const link =
+          el.querySelector("a")?.href
+            ? "https://www.google.com" +
+              el.querySelector("a")?.getAttribute("href")
+            : null;
+
+        const imageUrl =
+          el.querySelector("img")?.src || el.querySelector("img")?.getAttribute("data-src") || null;
+
+        return { name, price, link, imageUrl };
+      })
+      .filter(item => item.name && item.link && item.imageUrl);
+
+    if (!items.length) {
+      return res.json({
+        success: false,
+        results: [],
+        error: "Nenhum resultado encontrado",
+      });
+    }
+
+    return res.json({
+      success: true,
+      results: items,
+    });
+
+  } catch (err) {
+    console.error("Erro no /search:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Falha ao buscar produtos",
+      details: err.message,
+    });
+  }
+});
+
+// ===========================================================
+
+// Rota principal — scrape direto de URL
 app.post("/scrape", async (req, res) => {
   const { url } = req.body;
 
@@ -86,3 +165,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Backend rodando na porta ${PORT}`);
 });
+
