@@ -1,5 +1,4 @@
-# Use a imagem oficial Playwright (com Chromium instalado)
-FROM mcr.microsoft.com/playwright:v1.40.0-focal
+FROM mcr.microsoft.com/playwright:v1.56.1-focal
 
 WORKDIR /usr/src/app
 
@@ -8,8 +7,7 @@ RUN npm install --unsafe-perm
 
 COPY . .
 
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-
 EXPOSE 10000
 
 CMD ["node", "index.js"]
+
