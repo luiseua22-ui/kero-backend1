@@ -11,10 +11,7 @@ app.use(cors());
 // User Agent para simular desktop real e forçar carregamento completo
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-const limiter = rateLimit({
-  windowMs: 10 * 1000,
-  max: 20,
-});
+const limiter = rateLimit({ windowMs: 10 * 1000, max: 20 });
 app.use(limiter);
 
 const queue = new PQueue({ concurrency: 2 });
@@ -47,7 +44,6 @@ async function scrapeProduct(url) {
       userAgent: USER_AGENT,
       viewport: { width: 1920, height: 1080 },
       locale: 'pt-BR',
-      deviceScaleFactor: 1,
     });
 
     const page = await context.newPage();
@@ -55,79 +51,80 @@ async function scrapeProduct(url) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 });
 
-      // Tenta esperar o título mudar para algo real
+      // Espera o preço aparecer (seletor genérico de preço)
       try {
-        await page.waitForFunction(() => {
-            const t = (document.title || "").toLowerCase();
-            return !t.includes('carregando') && !t.includes('bem-vindo') && t.length > 15;
-        }, { timeout: 8000 });
+        await page.waitForSelector('[class*="price"], [class*="Price"]', { timeout: 8000 });
       } catch(e) {}
-      
-      await page.waitForTimeout(2000); // Espera o JS da VTEX montar o DOM
-      await autoScroll(page);
 
+      // Dados iniciais
       let data = { title: null, image: null, price: null, currency: null };
 
-      // 1. ESTRATÉGIA JSON-LD (Melhor para VTEX)
+      // 1. Tenta JSON-LD (Melhor fonte)
       try {
         const scripts = await page.$$eval('script[type="application/ld+json"]', nodes => nodes.map(n => n.textContent));
         for (const s of scripts) {
-            try {
-                const json = JSON.parse(s);
-                const items = Array.isArray(json) ? json : [json];
-                for (const item of items.flat()) {
-                    if (item && (item['@type'] === 'Product' || item['@type'] === 'ItemPage')) {
-                        if (!data.title) data.title = item.name;
-                        if (!data.image && item.image) {
-                            const img = Array.isArray(item.image) ? item.image[0] : item.image;
-                            data.image = typeof img === 'object' ? img.url : img;
-                        }
-                        if (item.offers) {
-                            const offers = Array.isArray(item.offers) ? item.offers : [item.offers];
-                            const valid = offers.find(o => o.price && parseFloat(o.price) > 0);
-                            if (valid) {
-                                data.price = valid.price;
-                                data.currency = valid.priceCurrency || 'BRL';
-                            }
+            const json = JSON.parse(s);
+            const items = Array.isArray(json) ? json : [json];
+            for (const item of items.flat()) {
+                if (item && (item['@type'] === 'Product' || item['@type'] === 'ItemPage')) {
+                    if (!data.title) data.title = item.name;
+                    if (!data.image && item.image) {
+                        const img = Array.isArray(item.image) ? item.image[0] : item.image;
+                        data.image = typeof img === 'object' ? img.url : img;
+                    }
+                    if (item.offers) {
+                        const offers = Array.isArray(item.offers) ? item.offers : [item.offers];
+                        // Filtra ofertas que não sejam parcelas (preço muito baixo para ser o total) ou zero
+                        const valid = offers.find(o => o.price && parseFloat(o.price) > 0);
+                        if (valid) {
+                            data.price = valid.price;
+                            data.currency = valid.priceCurrency || 'BRL';
                         }
                     }
                 }
-            } catch(e){}
+            }
         }
       } catch(e){}
 
-      // 2. ESTRATÉGIA SELETORES VTEX/WEPINK
+      // 2. Fallback Visual (Seletor VTEX específico)
       if (!data.price) {
-          // Tenta seletores específicos da plataforma VTEX
-          const selectors = [
-              '.vtex-product-price-1-x-sellingPriceValue', 
-              '.vtex-product-price-1-x-currencyContainer',
-              '.product-price',
-              '.skuBestPrice'
-          ];
-          for (const sel of selectors) {
-              const txt = await page.$eval(sel, el => el.innerText).catch(() => null);
-              if (txt) {
-                  data.price = txt.replace(/[^0-9,.]/g, '').replace(',', '.');
-                  data.currency = 'R$';
-                  break;
-              }
+          // Tenta pegar o preço de venda ("Selling Price") e ignora parcelas ("Installments")
+          const vtexPrice = await page.$eval('.vtex-product-price-1-x-sellingPriceValue .vtex-product-price-1-x-currencyContainer', el => el.innerText).catch(() => null);
+          if (vtexPrice) {
+              data.price = vtexPrice.replace(/[^0-9,.]/g, '').replace(',', '.');
+              data.currency = 'R$';
           }
       }
 
       if (!data.title) data.title = await page.title();
       
+      // Limpeza de Título (Remove sufixos de site)
+      if (data.title) {
+          data.title = data.title.split(' | ')[0].split(' - ')[0];
+      }
+
+      // Busca de Imagem Robusta
       if (!data.image) {
-          // Tenta imagem da VTEX
-          data.image = await page.$eval('.vtex-store-components-3-x-productImageTag', el => el.src).catch(() => null);
-          if (!data.image) data.image = await page.$eval('meta[property="og:image"]', el => el.content).catch(() => null);
+          // Tenta meta tags OpenGraph
+          data.image = await page.$eval('meta[property="og:image"]', el => el.content).catch(() => null);
+          
+          // Se falhar, tenta a primeira imagem grande do corpo
+          if (!data.image) {
+               data.image = await page.evaluate(() => {
+                   const imgs = Array.from(document.querySelectorAll('img'));
+                   const large = imgs.find(i => i.naturalWidth > 400 && !i.src.includes('svg'));
+                   return large ? large.src : null;
+               });
+          }
       }
 
       await browser.close();
 
-      // Formatação final
+      // Formatação Final
       let formattedPrice = null;
       if (data.price) {
+          // Lógica de segurança: Se o preço for muito baixo (< 30) e não for um acessório barato, pode ser parcela.
+          // Mas vamos confiar no scraper por enquanto.
           if (!String(data.price).includes('R$')) {
               formattedPrice = `R$ ${parseFloat(String(data.price)).toFixed(2).replace('.', ',')}`;
           } else {
@@ -150,24 +147,15 @@ async function scrapeProduct(url) {
   });
 }
 
-// --- MANTENHA AS ROTAS /search e /scrape IGUAIS AO ANTERIOR ---
-// (Apenas certifique-se de que a rota /scrape chame a função scrapeProduct acima)
-
 app.get('/healthz', (req, res) => res.json({ ok: true }));
-
 app.post('/scrape', async (req, res) => {
   const url = req.body?.url || req.query?.url;
   if (!url) return res.status(400).json({ success: false, error: "URL ausente" });
-  try {
-    const result = await scrapeProduct(url);
-    return res.json(result);
-  } catch (err) {
-    return res.status(500).json({ success: false, error: "Erro interno", details: err.message });
-  }
+  try { const result = await scrapeProduct(url); res.json(result); } 
+  catch (e) { res.status(500).json({success: false, error: e.message}); }
 });
 
 async function runGoogleSearch(q) {
-    // ... (mesmo código do anterior) ...
     const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
     const context = await browser.newContext({ userAgent: USER_AGENT });
     const page = await context.newPage();
