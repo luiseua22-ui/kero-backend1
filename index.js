@@ -3,13 +3,12 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { chromium } from "playwright";
 import PQueue from "p-queue";
-import { JSDOM } from "jsdom"; // ← NECESSÁRIO PARA O /search
+import { JSDOM } from "jsdom";
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Rate limit — impede abuso
 const limiter = rateLimit({
   windowMs: 10 * 1000,
   max: 7,
@@ -17,10 +16,9 @@ const limiter = rateLimit({
 
 app.use(limiter);
 
-// Fila para evitar excesso de browsers simultâneos
 const queue = new PQueue({ concurrency: 2 });
 
-// Função principal de scraping (para URL)
+// Melhorar a função de scraping para mais sites
 async function scrapeProduct(url) {
   return queue.add(async () => {
     const browser = await chromium.launch({
@@ -28,57 +26,83 @@ async function scrapeProduct(url) {
     });
 
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "networkidle" });
+    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
 
-    const title =
-      (await page.$eval("h1", el => el.innerText.trim()).catch(() => null)) ||
-      (await page.$eval("title", el => el.innerText.trim()).catch(() => null));
+    // Múltiplas estratégias para obter título
+    const title = await page.evaluate(() => {
+      return (
+        document.querySelector("h1")?.innerText?.trim() ||
+        document.querySelector('meta[property="og:title"]')?.content ||
+        document.querySelector('meta[name="title"]')?.content ||
+        document.title?.trim() ||
+        "Produto não encontrado"
+      );
+    });
 
-    const price =
-      (await page
-        .$eval('[class*="price"], .price, [itemprop="price"]', el =>
-          el.innerText.replace(/[^\d,]/g, "")
-        )
-        .catch(() => null));
+    // Múltiplas estratégias para obter preço
+    const price = await page.evaluate(() => {
+      const priceSelectors = [
+        '[class*="price"]',
+        '.price',
+        '[itemprop="price"]',
+        '[data-price]',
+        '.product-price',
+        '.price-current',
+        '.sales-price',
+        '.final-price'
+      ];
+      
+      for (const selector of priceSelectors) {
+        const element = document.querySelector(selector);
+        if (element) {
+          const text = element.innerText?.trim();
+          if (text && text.match(/[\d,.]/)) {
+            return text.replace(/\s+/g, ' ');
+          }
+        }
+      }
+      return null;
+    });
 
-    const image =
-      (await page.$eval("img", el => el.src).catch(() => null)) ||
-      (await page
-        .$eval('meta[property="og:image"]', el => el.content)
-        .catch(() => null));
+    // Múltiplas estratégias para obter imagem
+    const image = await page.evaluate(() => {
+      return (
+        document.querySelector('meta[property="og:image"]')?.content ||
+        document.querySelector('meta[name="og:image"]')?.content ||
+        document.querySelector('link[rel="image_src"]')?.href ||
+        document.querySelector('.product-image img')?.src ||
+        document.querySelector('#image img')?.src ||
+        document.querySelector('img[alt*="produto"]')?.src ||
+        document.querySelector('img[class*="product"]')?.src
+      );
+    });
 
     await browser.close();
 
     return {
       success: true,
       url,
-      title: title || "Título não encontrado",
-      price: price || null,
+      title: title || "Produto não encontrado",
+      price: price || "Preço não disponível",
       image: image || null,
     };
   });
 }
 
-// ===========================================================
-// 🚀 NOVO ENDPOINT: /search — busca real com Google Shopping
-// ===========================================================
+// ENDPOINT /search - CORRIGIDO para POST
+app.post("/search", async (req, res) => {
+  const { query } = req.body;
 
-app.get("/search", async (req, res) => {
-  const q = req.query.q?.trim();
-
-  if (!q) {
-    return res.status(400).json({ error: "Parâmetro 'q' ausente" });
+  if (!query) {
+    return res.status(400).json({ error: "Parâmetro 'query' ausente" });
   }
 
   try {
-    // Pesquisa real no Google Shopping
-    const url =
-      "https://www.google.com/search?tbm=shop&hl=pt-BR&q=" +
-      encodeURIComponent(q);
+    const url = "https://www.google.com/search?tbm=shop&hl=pt-BR&q=" + encodeURIComponent(query);
 
     const browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "networkidle" });
+    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
 
     const html = await page.content();
     await browser.close();
@@ -86,31 +110,40 @@ app.get("/search", async (req, res) => {
     const dom = new JSDOM(html);
     const document = dom.window.document;
 
-    const items = [...document.querySelectorAll(".sh-dgr__content")]
-      .slice(0, 15) // ← garante pelo menos 15 itens
+    const items = [...document.querySelectorAll(".sh-dgr__content, .sh-dlr__content")]
+      .slice(0, 15)
       .map(el => {
         const name =
           el.querySelector(".tAxDx")?.textContent?.trim() ||
+          el.querySelector(".A2sOrd")?.textContent?.trim() ||
+          el.querySelector("h3")?.textContent?.trim() ||
           el.querySelector("h4")?.textContent?.trim() ||
-          null;
+          "Nome não disponível";
 
         const price =
           el.querySelector(".a8Pemb")?.textContent?.trim() ||
-          el.querySelector(".span")?.textContent?.trim() ||
-          null;
+          el.querySelector(".T14wmb")?.textContent?.trim() ||
+          el.querySelector('[class*="price"]')?.textContent?.trim() ||
+          "Preço não disponível";
 
-        const link =
-          el.querySelector("a")?.href
-            ? "https://www.google.com" +
-              el.querySelector("a")?.getAttribute("href")
-            : null;
+        const linkElement = el.querySelector("a");
+        const link = linkElement ? 
+          (linkElement.href.startsWith("http") ? linkElement.href : "https://www.google.com" + linkElement.getAttribute("href"))
+          : null;
 
-        const imageUrl =
-          el.querySelector("img")?.src || el.querySelector("img")?.getAttribute("data-src") || null;
+        const imageElement = el.querySelector("img");
+        const imageUrl = imageElement ? 
+          (imageElement.src || imageElement.getAttribute("data-src")) 
+          : null;
 
-        return { name, price, link, imageUrl };
+        return { 
+          name, 
+          price, 
+          link, 
+          imageUrl: imageUrl || "https://via.placeholder.com/150?text=Sem+Imagem" 
+        };
       })
-      .filter(item => item.name && item.link && item.imageUrl);
+      .filter(item => item.name && item.link);
 
     if (!items.length) {
       return res.json({
@@ -135,9 +168,7 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// ===========================================================
-
-// Rota principal — scrape direto de URL
+// Rota principal de scraping
 app.post("/scrape", async (req, res) => {
   const { url } = req.body;
 
@@ -147,7 +178,8 @@ app.post("/scrape", async (req, res) => {
     const data = await scrapeProduct(url);
     res.json(data);
   } catch (err) {
-    res.json({
+    console.error("Erro no /scrape:", err);
+    res.status(500).json({
       success: false,
       error: "Falha ao extrair produto",
       details: err.message,
@@ -165,4 +197,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Backend rodando na porta ${PORT}`);
 });
-
