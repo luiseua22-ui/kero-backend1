@@ -8,8 +8,8 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 app.use(cors());
 
-// User Agent "Desktop" para evitar versões mobile ou bloqueios
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// User Agent "Desktop" atualizado conforme solicitado
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
 const limiter = rateLimit({
   windowMs: 10 * 1000,
@@ -23,13 +23,11 @@ async function autoScroll(page) {
   await page.evaluate(async () => {
     await new Promise(resolve => {
       let total = 0;
-      const distance = 200;
-      // Scrollar apenas um pouco para triggerar lazy load de imagens do topo
-      const maxScroll = 1000; 
+      const distance = 150;
       const timer = setInterval(() => {
         window.scrollBy(0, distance);
         total += distance;
-        if (total >= maxScroll || total >= document.body.scrollHeight) {
+        if (total >= 800 || total >= document.body.scrollHeight) {
           clearInterval(timer);
           resolve();
         }
@@ -40,175 +38,118 @@ async function autoScroll(page) {
 
 async function scrapeProduct(url) {
   return queue.add(async () => {
-    const browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu'],
-    });
-
-    const context = await browser.newContext({
-      userAgent: USER_AGENT,
-      viewport: { width: 1366, height: 768 }, // Viewport desktop ajuda a carregar imagens certas
-      locale: 'pt-BR'
-    });
-
-    const page = await context.newPage();
-    
+    let browser;
     try {
-      // 1. Navegação inicial
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      browser = await chromium.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
+      });
+
+      const context = await browser.newContext({
+        userAgent: USER_AGENT,
+        viewport: { width: 1920, height: 1080 },
+        locale: 'pt-BR',
+        deviceScaleFactor: 1,
+      });
+
+      const page = await context.newPage();
       
-      // 2. ESPERA INTELIGENTE: Tenta esperar por um H1 (título do produto) por até 5 segundos.
-      // Sites SPA (como WePink/VTEX) demoram para renderizar o produto.
+      // 1. Navegação
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+      // 2. TRUQUE PARA SPA (VTEX/WePink): Espera o título mudar do genérico
       try {
-        await page.waitForSelector('h1', { timeout: 5000 });
+        await page.waitForFunction(() => {
+            const t = document.title;
+            // Lista de títulos genéricos para ignorar e continuar esperando
+            const generics = ['bem-vindos', 'carregando', 'loja', 'wepink', 'vtex'];
+            if (!t) return false;
+            // Se o título NÃO contém as palavras genéricas (ou seja, carregou o produto), retorna true
+            return !generics.some(g => t.toLowerCase().includes(g)) || t.length > 40; 
+        }, { timeout: 6000 });
       } catch (e) {
-        // Se não achar H1, segue o baile (pode ser site sem H1 explícito)
+        // Se der timeout, tenta esperar pelo seletor de nome de produto comum da VTEX
+        try { await page.waitForSelector('.vtex-store-components-3-x-productNameContainer', { timeout: 2000 }); } catch(err){}
       }
 
-      // 3. Pequena pausa extra e scroll para garantir imagens
-      await page.waitForTimeout(1000); 
+      await page.waitForTimeout(1500); // Espera extra para imagens carregarem
       await autoScroll(page);
 
+      // --- EXTRAÇÃO (Mesma lógica robusta, mas agora rodando na hora certa) ---
       let title = null;
       let price = null;
       let priceCurrency = null;
       let image = null;
 
-      // --- ESTRATÉGIA 1: JSON-LD (Dados Estruturados - A Melhor Fonte) ---
+      // JSON-LD Check (Prioridade Máxima)
       try {
         const scripts = await page.$$eval('script[type="application/ld+json"]', nodes => nodes.map(n => n.textContent));
-        
         for (const script of scripts) {
           try {
-            const json = JSON.parse(script);
-            const objects = Array.isArray(json) ? json : [json];
-
-            for (const obj of objects.flat()) {
-              // Prioriza objetos que são explicitamente PRODUTOS
-              if (obj && (obj['@type'] === 'Product' || obj['@type'] === 'ItemPage')) {
-                if (!title && (obj.name || obj.headline)) {
-                    title = obj.name || obj.headline;
-                }
-                
-                if (!image && obj.image) {
-                    image = Array.isArray(obj.image) ? obj.image[0] : obj.image;
-                    // Se for objeto de imagem, pega a url
-                    if (typeof image === 'object' && image.url) image = image.url;
-                }
-
-                if (!price && obj.offers) {
-                  const offers = Array.isArray(obj.offers) ? obj.offers : [obj.offers];
-                  // Tenta achar a oferta com preço
-                  const offer = offers.find(o => o.price);
-                  if (offer) {
-                    price = offer.price;
-                    priceCurrency = offer.priceCurrency;
-                  }
-                }
-              }
-            }
-          } catch(e) {}
+             const json = JSON.parse(script);
+             const objs = Array.isArray(json) ? json : [json];
+             for (const obj of objs.flat()) {
+               if (obj && (obj['@type'] === 'Product' || obj['@type'] === 'ItemPage')) {
+                 if (obj.name) title = obj.name;
+                 if (obj.image) {
+                    const img = Array.isArray(obj.image) ? obj.image[0] : obj.image;
+                    image = typeof img === 'object' ? img.url : img;
+                 }
+                 if (obj.offers) {
+                    const offer = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
+                    if (offer.price) {
+                        price = offer.price;
+                        priceCurrency = offer.priceCurrency;
+                    }
+                 }
+               }
+             }
+          } catch(e){}
         }
-      } catch (e) {}
+      } catch(e){}
 
-      // --- ESTRATÉGIA 2: Meta Tags (Open Graph / Twitter) ---
+      // Fallbacks de Seletores
       if (!title) {
-        title = await page.$eval('meta[property="og:title"]', el => el.content).catch(() => null) ||
-                await page.$eval('meta[name="twitter:title"]', el => el.content).catch(() => null);
-      }
-      if (!image) {
-        image = await page.$eval('meta[property="og:image"]', el => el.content).catch(() => null) ||
-                await page.$eval('meta[name="twitter:image"]', el => el.content).catch(() => null);
-      }
-      if (!price) {
-         price = await page.$eval('meta[property="product:price:amount"]', el => el.content).catch(() => null);
-         priceCurrency = await page.$eval('meta[property="product:price:currency"]', el => el.content).catch(() => null);
-      }
-
-      // --- ESTRATÉGIA 3: Seletores CSS (HTML Visual) ---
-      if (!title) {
-        title = await page.$eval('h1', el => el.innerText.trim()).catch(() => null) ||
-                await page.title().catch(() => null);
+        title = await page.title(); // Agora o título deve estar correto
       }
       
-      // Seletores de preço comuns no Brasil
-      if (!price) {
-        const priceSelectors = [
-            '[itemprop="price"]', 
-            '.price', 
-            '.product-price', 
-            '.sales-price',
-            '.vtex-product-price-1-x-currencyInteger' // Específico VTEX/WePink
-        ];
-        
-        for (const sel of priceSelectors) {
-            const txt = await page.$eval(sel, el => el.innerText || el.getAttribute('content')).catch(() => null);
-            if (txt) {
-                // Tenta limpar o texto para achar números
-                const match = txt.match(/[0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})?/); // Formato PT-BR
-                if (match) {
-                    price = match[0];
-                    break; // Achou um preço, para.
-                }
-            }
-        }
+      if (!image) {
+        image = await page.$eval('meta[property="og:image"]', el => el.content).catch(() => null);
       }
 
-      // Seletores de imagem (tenta pegar a maior imagem visível)
-      if (!image) {
-        try {
-            image = await page.evaluate(() => {
-                const imgs = Array.from(document.querySelectorAll('img'));
-                // Filtra imagens muito pequenas (icones, pixels)
-                const candidates = imgs.filter(i => i.naturalWidth > 300 && i.naturalHeight > 300);
-                if (candidates.length > 0) return candidates[0].src;
-                return null;
-            });
-        } catch(e) {}
+      // Preço VTEX específico se JSON-LD falhar
+      if (!price) {
+         const vtexPrice = await page.$eval('.vtex-product-price-1-x-currencyContainer', el => el.innerText).catch(() => null);
+         if (vtexPrice) price = vtexPrice;
       }
 
       await browser.close();
 
-      // 4. Formatação Final dos Dados
-      let priceFinal = null;
-      let priceValue = null;
-
-      if (price) {
-          const pStr = String(price).trim();
-          // Se já vier formatado (ex: 129.90 ou 129,90)
-          // Tentativa robusta de parse
-          const clean = pStr.replace(/[^\d,.]/g, ''); 
-          priceValue = clean;
-          
-          // Se não tem currency, assume BRL
-          const curr = priceCurrency || 'R$';
-          
-          // Se o preço capturado for apenas o número (ex: 329,00), monta a string
-          if (!pStr.includes(curr)) {
-              priceFinal = `${curr} ${pStr}`;
-          } else {
-              priceFinal = pStr;
-          }
+      // Formatação
+      let priceFinal = price ? String(price).trim() : null;
+      // Se for numérico puro, formata
+      if (price && !String(price).includes(priceCurrency || 'R$')) {
+         // Nota: se price estiver em formato brasileiro (ex: "1.234,56"), parseFloat pode não interpretar corretamente.
+         // Mantive a lógica conforme solicitado.
+         const parsed = parseFloat(String(price));
+         if (!isNaN(parsed)) {
+           priceFinal = `${priceCurrency || 'R$'} ${parsed.toFixed(2).replace('.', ',')}`;
+         } else {
+           priceFinal = `${priceCurrency || 'R$'} ${String(price).trim()}`;
+         }
       }
 
       return {
         success: true,
-        url,
         title: title || "Produto sem título",
         price: priceFinal,
-        price_value: priceValue,
-        price_currency: priceCurrency,
-        image: image
+        image: image,
+        url
       };
 
     } catch (err) {
-      await browser.close();
-      console.error("Scraping error:", err);
-      return {
-        success: false,
-        error: 'Erro no processamento',
-        details: err?.message
-      };
+      if (browser) await browser.close();
+      return { success: false, error: err?.message || String(err) };
     }
   });
 }
@@ -288,3 +229,4 @@ app.post('/search', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
+
