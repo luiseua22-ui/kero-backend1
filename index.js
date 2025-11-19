@@ -1,517 +1,282 @@
 import express from "express";
+import { chromium } from "playwright";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { chromium } from "playwright";
 import PQueue from "p-queue";
-import { JSDOM } from "jsdom";
 
 const app = express();
-app.use(express.json());
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type"]
-}));
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+
+app.get("/", (req, res) => {
+  res.send("Kero Backend v2 Rodando...");
+});
 
 const limiter = rateLimit({
   windowMs: 10 * 1000,
-  max: 10,
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
-
 app.use(limiter);
 
 const queue = new PQueue({ concurrency: 2 });
 
-// Função melhorada de scraping
+// ------------------------------------------------------------
+// SCROLL PARA LAZY-LOAD DE IMAGENS
+// ------------------------------------------------------------
+async function autoScroll(page) {
+  await page.evaluate(async () => {
+    await new Promise((resolve) => {
+      let total = 0;
+      const distance = 350;
+      const timer = setInterval(() => {
+        window.scrollBy(0, distance);
+        total += distance;
+        if (total > document.body.scrollHeight) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 200);
+    });
+  });
+}
+
+// ------------------------------------------------------------
+// FUNÇÃO PRINCIPAL DE SCRAPING
+// ------------------------------------------------------------
 async function scrapeProduct(url) {
   return queue.add(async () => {
-    let browser;
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+
+    const page = await browser.newPage();
+
     try {
-      console.log(`🎯 Iniciando scraping para: ${url}`);
-      
-      browser = await chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-      });
+      await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
+      await page.waitForTimeout(1000);
+      await autoScroll(page);
+      await page.waitForTimeout(300);
 
-      const page = await browser.newPage();
-      
-      // Configurar headers para evitar bloqueios
-      await page.setExtraHTTPHeaders({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br'
-      });
+      let title = null;
+      let price = null;
+      let priceCurrency = null;
+      let image = null;
 
-      console.log(`🌐 Navegando para: ${url}`);
-      await page.goto(url, { 
-        waitUntil: "networkidle", 
-        timeout: 30000 
-      });
+      // ----------------------------
+      // 1) JSON-LD
+      // ----------------------------
+      const ldJsons = await page.$$eval(
+        'script[type="application/ld+json"]',
+        (nodes) => nodes.map((n) => n.textContent)
+      );
 
-      // Aguardar um pouco para carregar conteúdo dinâmico
-      await page.waitForTimeout(3000);
+      for (const txt of ldJsons) {
+        try {
+          const parsed = JSON.parse(txt);
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
 
-      // Extrair dados com múltiplas estratégias
-      const productData = await page.evaluate(() => {
-        console.log("🔍 Iniciando extração de dados...");
+          for (const obj of arr.flat()) {
+            if (obj["@type"] === "Product") {
+              title = title || obj.name || obj.headline || null;
 
-        // Estratégias para título
-        const getTitle = () => {
-          const selectors = [
-            'h1',
-            'h1[class*="product"]',
-            'h1[class*="title"]',
-            '[class*="product-name"]',
-            '[class*="product-title"]',
-            '.product-title',
-            '.product-name',
-            '.title',
-            '.name',
-            'meta[property="og:title"]',
-            'meta[name="title"]',
-            'title'
-          ];
-          
-          for (const selector of selectors) {
-            try {
-              const element = document.querySelector(selector);
-              if (element) {
-                let text = '';
-                if (selector.startsWith('meta')) {
-                  text = element.getAttribute('content')?.trim() || '';
-                } else if (selector === 'title') {
-                  text = element.textContent?.trim() || '';
-                } else {
-                  text = element.textContent?.trim() || '';
-                }
-                
-                if (text && text.length > 3 && text.length < 200) {
-                  console.log(`✅ Título encontrado com seletor: ${selector}`, text);
-                  return text;
-                }
+              if (obj.image) {
+                image =
+                  image ||
+                  (Array.isArray(obj.image) ? obj.image[0] : obj.image);
               }
-            } catch (e) {
-              console.log(`❌ Erro no seletor ${selector}:`, e);
+
+              if (obj.offers) {
+                const offer = Array.isArray(obj.offers)
+                  ? obj.offers[0]
+                  : obj.offers;
+
+                price = price || offer?.price;
+                priceCurrency = priceCurrency || offer?.priceCurrency || null;
+              }
             }
           }
-          return "Produto não encontrado";
-        };
+        } catch {}
+      }
 
-        // Estratégias para preço
-        const getPrice = () => {
-          const priceSelectors = [
-            '[class*="price"]',
-            '.price',
-            '[itemprop="price"]',
-            '[data-price]',
-            '.product-price',
-            '.price-current',
-            '.sales-price',
-            '.final-price',
-            '.value',
-            '.cost',
-            '.amount',
-            '.preco',
-            '.valor'
-          ];
-          
-          for (const selector of priceSelectors) {
-            try {
-              const elements = document.querySelectorAll(selector);
-              for (const element of elements) {
-                const text = element.textContent?.trim();
-                if (text && /R\$\s*\d+[.,]\d+|\d+[.,]\d+\s*R\$|[\d.,]+\s*(reais|RS)|USD\s*[\d.,]+|\d+[.,]\d+/.test(text)) {
-                  console.log(`✅ Preço encontrado com seletor: ${selector}`, text);
-                  return text.replace(/\s+/g, ' ').substring(0, 50);
-                }
-              }
-            } catch (e) {
-              console.log(`❌ Erro no seletor de preço ${selector}:`, e);
-            }
-          }
-          return "Preço não disponível";
-        };
+      // ----------------------------
+      // 2) OG TAGS, <h1>, TITLE
+      // ----------------------------
+      if (!title) {
+        title =
+          (await page
+            .$eval('meta[property="og:title"]', (el) => el.content)
+            .catch(() => null)) ||
+          (await page
+            .$eval('meta[name="title"]', (el) => el.content)
+            .catch(() => null)) ||
+          (await page.$eval("h1", (el) => el.innerText).catch(() => null)) ||
+          (await page.title().catch(() => null));
+      }
 
-        // Estratégias para imagem
-        const getImage = () => {
-          const imageSelectors = [
-            'meta[property="og:image"]',
-            'meta[name="og:image"]',
-            'meta[property="twitter:image"]',
-            '.product-image img',
-            '.image img',
-            '#image img',
-            'img[alt*="produto"]',
-            'img[alt*="product"]',
-            'img[class*="product"]',
-            'img[class*="image"]',
-            '.main-image img',
-            '.gallery img',
-            '.zoomImg',
-            '[data-zoom-image]',
-            '.product-img',
-            '.product-image'
-          ];
-          
-          for (const selector of imageSelectors) {
-            try {
-              const element = document.querySelector(selector);
-              if (element) {
-                let src = '';
-                if (selector.startsWith('meta')) {
-                  src = element.getAttribute('content') || '';
-                } else {
-                  src = element.getAttribute('src') || 
-                         element.getAttribute('data-src') ||
-                         element.getAttribute('data-zoom-image') ||
-                         '';
-                }
-                
-                if (src) {
-                  // Converter URL relativa para absoluta
-                  if (src.startsWith('//')) {
-                    src = 'https:' + src;
-                  } else if (src.startsWith('/')) {
-                    src = window.location.origin + src;
-                  }
-                  
-                  if (src.startsWith('http')) {
-                    console.log(`✅ Imagem encontrada com seletor: ${selector}`, src.substring(0, 100));
-                    return src;
-                  }
-                }
-              }
-            } catch (e) {
-              console.log(`❌ Erro no seletor de imagem ${selector}:`, e);
-            }
-          }
-          return null;
-        };
+      if (!image) {
+        image =
+          (await page
+            .$eval('meta[property="og:image"]', (el) => el.content)
+            .catch(() => null)) ||
+          (await page
+            .$eval('link[rel="image_src"]', (el) => el.href)
+            .catch(() => null)) ||
+          (await page
+            .$eval('[itemprop="image"]', (el) => el.src)
+            .catch(() => null));
+      }
 
-        return {
-          title: getTitle(),
-          price: getPrice(),
-          image: getImage()
-        };
-      });
+      // ----------------------------
+      // 3) PREÇO
+      // ----------------------------
+      if (!price) {
+        price =
+          (await page
+            .$eval('[itemprop="price"]', (el) => el.content || el.innerText)
+            .catch(() => null)) ||
+          (await page
+            .$eval('[class*="price"]', (el) => el.innerText)
+            .catch(() => null)) ||
+          null;
+      }
 
-      console.log('📦 Dados extraídos:', productData);
+      let price_text = price ? String(price).trim() : null;
+      let price_value = null;
+
+      if (price_text) {
+        const currencyMatch = price_text.match(
+          /(R\$|BRL|USD|\$|EUR|€)/i
+        );
+        if (currencyMatch) priceCurrency = priceCurrency || currencyMatch[0];
+
+        const numMatch = price_text.match(/[\d\.,]+/);
+        if (numMatch) {
+          price_value = numMatch[0]
+            .replace(/\.(?=\d{3}\b)/g, "")
+            .replace(",", ".");
+        }
+      }
+
+      // ----------------------------
+      // 4) FALLBACK DE IMAGEM (evitar logos)
+      // ----------------------------
+      if (!image) {
+        const imgs = await page.$$eval("img", (imgs) =>
+          imgs.slice(0, 30).map((i) => ({
+            src: i.src || i.getAttribute("data-src") || "",
+            w: i.naturalWidth || 0,
+            h: i.naturalHeight || 0,
+          }))
+        );
+        const big = imgs.filter((i) => i.w >= 200 && i.h >= 200);
+        image = big.length ? big[0].src : imgs[0]?.src || null;
+      }
 
       await browser.close();
+
+      const formattedPrice =
+        price_value && priceCurrency
+          ? `${priceCurrency} ${price_value.replace(".", ",")}`
+          : price_text || null;
 
       return {
         success: true,
         url,
-        title: productData.title,
-        price: productData.price,
-        image: productData.image,
+        title: title || "Título não encontrado",
+        price: formattedPrice,
+        price_value,
+        price_currency: priceCurrency,
+        image,
       };
-
-    } catch (error) {
-      console.error('💥 Erro no scraping:', error);
-      if (browser) {
-        await browser.close();
-      }
-      throw error;
+    } catch (err) {
+      await browser.close();
+      return {
+        success: false,
+        error: "Erro no scraping",
+        details: err.message,
+      };
     }
   });
 }
 
-// ENDPOINT /search
-app.post("/search", async (req, res) => {
-  const { query } = req.body;
-
-  console.log(`🔎 Recebida pesquisa: "${query}"`);
-
-  if (!query) {
-    return res.status(400).json({ 
-      success: false,
-      error: "Parâmetro 'query' ausente" 
-    });
-  }
-
-  let browser;
-  try {
-    const searchUrl = "https://www.google.com/search?tbm=shop&hl=pt-BR&q=" + encodeURIComponent(query);
-    console.log(`🌐 Buscando no Google Shopping: ${searchUrl}`);
-
-    browser = await chromium.launch({ 
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-    
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    });
-
-    await page.goto(searchUrl, { 
-      waitUntil: "networkidle", 
-      timeout: 20000 
-    });
-
-    await page.waitForTimeout(5000);
-
-    const html = await page.content();
-    await browser.close();
-
-    const dom = new JSDOM(html);
-    const document = dom.window.document;
-
-    // Múltiplos seletores para resultados do Google Shopping
-    const resultSelectors = [
-      ".sh-dgr__content",
-      ".sh-dlr__content", 
-      ".i0X6df",
-      ".sh-dgr__grid-result",
-      ".mnr-c",
-      ".sh-dgr__grid-result"
-    ];
-
-    let items = [];
-    
-    for (const selector of resultSelectors) {
-      const elements = document.querySelectorAll(selector);
-      if (elements.length > 0) {
-        console.log(`📊 Encontrados ${elements.length} resultados com seletor: ${selector}`);
-        
-        items = Array.from(elements).slice(0, 10).map(el => {
-          try {
-            // Nome do produto
-            const nameSelectors = [
-              ".tAxDx",
-              ".A2sOrd", 
-              ".translate-content",
-              "h3",
-              "h4",
-              ".EI11Pd",
-              ".sh-np__product-title"
-            ];
-            
-            let name = "Produto";
-            for (const nameSelector of nameSelectors) {
-              const nameEl = el.querySelector(nameSelector);
-              if (nameEl?.textContent?.trim()) {
-                name = nameEl.textContent.trim();
-                break;
-              }
-            }
-
-            // Preço
-            const priceSelectors = [
-              ".a8Pemb",
-              ".T14wmb",
-              ".OFFNJ",
-              ".a8Pemb OFFNJ",
-              '[class*="price"]'
-            ];
-            
-            let price = "Preço não disponível";
-            for (const priceSelector of priceSelectors) {
-              const priceEl = el.querySelector(priceSelector);
-              if (priceEl?.textContent?.trim()) {
-                price = priceEl.textContent.trim();
-                break;
-              }
-            }
-
-            // Link
-            const linkElement = el.querySelector("a");
-            let link = null;
-            if (linkElement) {
-              const href = linkElement.getAttribute("href");
-              if (href) {
-                link = href.startsWith("http") ? href : "https://www.google.com" + href;
-              }
-            }
-
-            // Imagem
-            const imageElement = el.querySelector("img");
-            let imageUrl = "https://via.placeholder.com/150?text=Sem+Imagem";
-            if (imageElement) {
-              imageUrl = imageElement.getAttribute("src") || 
-                        imageElement.getAttribute("data-src") ||
-                        imageElement.getAttribute("data-iurl") ||
-                        imageUrl;
-            }
-
-            return { 
-              name: name || "Produto sem nome", 
-              price, 
-              link: link || `https://www.google.com/search?q=${encodeURIComponent(query)}`,
-              imageUrl
-            };
-          } catch (itemError) {
-            console.error('❌ Erro ao processar item:', itemError);
-            return null;
-          }
-        }).filter(item => item !== null && item.name && item.link);
-
-        break;
-      }
-    }
-
-    console.log(`✅ Retornando ${items.length} itens para "${query}"`);
-
-    if (items.length === 0) {
-      return res.json({
-        success: false,
-        results: [],
-        error: "Nenhum resultado encontrado para: " + query,
-      });
-    }
-
-    return res.json({
-      success: true,
-      results: items,
-    });
-
-  } catch (err) {
-    console.error("💥 Erro no /search:", err);
-    if (browser) {
-      await browser.close();
-    }
-    return res.status(500).json({
-      success: false,
-      error: "Falha ao buscar produtos",
-      details: err.message,
-    });
-  }
-});
-
-// Rota principal de scraping
+// ------------------------------------------------------------
+// ENDPOINT /scrape
+// ------------------------------------------------------------
 app.post("/scrape", async (req, res) => {
   const { url } = req.body;
+  if (!url) return res.status(400).json({ success: false, error: "URL ausente." });
 
-  console.log(`🎯 Recebida URL para scraping: ${url}`);
+  const result = await scrapeProduct(url);
+  res.json(result);
+});
 
-  if (!url) {
-    return res.status(400).json({ 
-      success: false,
-      error: "URL ausente" 
-    });
-  }
+// ------------------------------------------------------------
+// ENDPOINT /search (GOOGLE SHOPPING)
+// ------------------------------------------------------------
+app.get("/search", async (req, res) => {
+  const query = (req.query.q || "").toString().trim();
+  if (!query)
+    return res.status(400).json({ success: false, error: "Query vazia." });
 
-  // Validar URL
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+  const page = await browser.newPage();
+
   try {
-    new URL(url);
-  } catch (e) {
-    return res.status(400).json({
-      success: false,
-      error: "URL inválida: " + url
-    });
-  }
+    const qUrl = `https://www.google.com/search?q=${encodeURIComponent(
+      query
+    )}&tbm=shop`;
 
-  try {
-    const data = await scrapeProduct(url);
-    console.log(`✅ Scraping concluído para: ${url}`);
-    res.json(data);
+    await page.goto(qUrl, { waitUntil: "networkidle", timeout: 20000 });
+    await page.waitForTimeout(1200);
+
+    const items = await page.$$eval(
+      ".sh-dgr__content",
+      (nodes) =>
+        nodes.map((n) => {
+          const get = (sel, attr = "innerText") => {
+            const el = n.querySelector(sel);
+            return el ? (attr === "innerText" ? el.innerText : el.getAttribute(attr)) : null;
+          };
+
+          return {
+            name: get(".tAxDx") || get(".EI11Pd"),
+            price: get(".a8Pemb"),
+            imageUrl: get("img", "src"),
+            link: get("a.shntl", "href"),
+          };
+        }).filter((x) => x.name)
+    );
+
+    const normalized = items.map((i) => ({
+      name: i.name,
+      price: i.price,
+      imageUrl: i.imageUrl,
+      link: i.link ? `https://www.google.com${i.link}` : "",
+    }));
+
+    await browser.close();
+    res.json({ success: true, results: normalized });
   } catch (err) {
-    console.error("💥 Erro no /scrape:", err);
+    await browser.close();
     res.status(500).json({
       success: false,
-      error: "Falha ao extrair produto da URL: " + url,
+      error: "Falha na pesquisa",
       details: err.message,
     });
   }
 });
 
-// Healthcheck - AGORA FUNCIONA VIA GET
-app.get("/healthz", (req, res) => {
-  res.json({ 
-    ok: true,
-    message: "Backend está funcionando perfeitamente! ✅",
-    timestamp: new Date().toISOString(),
-    version: "2.0.0"
-  });
-});
-
-// Rota de teste - AGORA FUNCIONA VIA GET
-app.get("/test", async (req, res) => {
-  try {
-    console.log("🧪 Teste solicitado...");
-    const browser = await chromium.launch({ 
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-    const page = await browser.newPage();
-    await page.goto('https://httpbin.org/user-agent', { 
-      waitUntil: "networkidle",
-      timeout: 15000 
-    });
-    const content = await page.textContent('body');
-    await browser.close();
-    
-    res.json({
-      success: true,
-      message: "✅ Backend e Playwright estão funcionando perfeitamente!",
-      test: "Conectado com sucesso à internet",
-      content: content ? content.substring(0, 200) + "..." : "Sem conteúdo"
-    });
-  } catch (error) {
-    console.error("💥 Erro no teste:", error);
-    res.status(500).json({
-      success: false,
-      error: "❌ Playwright não está funcionando",
-      details: error.message
-    });
-  }
-});
-
-// Rota simples de teste sem Playwright
-app.get("/simple-test", (req, res) => {
-  res.json({
-    success: true,
-    message: "✅ Backend está respondendo normalmente!",
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || "development"
-  });
-});
-
-// Rota para testar scraping com exemplo
-app.get("/test-scrape", async (req, res) => {
-  try {
-    const testUrl = "https://www.amazon.com.br";
-    console.log(`🧪 Testando scraping com: ${testUrl}`);
-    
-    const browser = await chromium.launch({ 
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-    const page = await browser.newPage();
-    await page.goto(testUrl, { 
-      waitUntil: "networkidle",
-      timeout: 15000 
-    });
-    const title = await page.title();
-    await browser.close();
-    
-    res.json({
-      success: true,
-      message: "✅ Scraping teste funcionando!",
-      title: title,
-      url: testUrl
-    });
-  } catch (error) {
-    console.error("💥 Erro no teste de scraping:", error);
-    res.status(500).json({
-      success: false,
-      error: "❌ Teste de scraping falhou",
-      details: error.message
-    });
-  }
-});
-
-// Start server
-const PORT = process.env.PORT || 10000;
+// ------------------------------------------------------------
+// START SERVER
+// ------------------------------------------------------------
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n🎉 BACKEND INICIADO COM SUCESSO!`);
-  console.log(`📍 Porta: ${PORT}`);
-  console.log(`🔗 Health check: https://kero-backend1.onrender.com/healthz`);
-  console.log(`🧪 Teste simples: https://kero-backend1.onrender.com/simple-test`);
-  console.log(`🌐 Teste scraping: https://kero-backend1.onrender.com/test-scrape`);
-  console.log(`⏰ ${new Date().toLocaleString('pt-BR')}`);
-  console.log(`=========================================\n`);
+  console.log(`Backend KERO rodando na porta ${PORT}`);
 });
+
