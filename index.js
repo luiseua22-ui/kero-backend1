@@ -8,7 +8,10 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 app.use(cors()); // permite chamadas do front
 
-// Rate limit (aumentei um pouco)
+// User Agent para parecer um navegador real e evitar bloqueios
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// Rate limit
 const limiter = rateLimit({
   windowMs: 10 * 1000,
   max: 20,
@@ -44,12 +47,19 @@ async function scrapeProduct(url) {
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
     });
 
-    const page = await browser.newPage();
+    // CRÍTICO: Usar contexto com User Agent
+    const context = await browser.newContext({
+      userAgent: USER_AGENT
+    });
+
+    const page = await context.newPage();
+    
     try {
-      await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
-      await page.waitForTimeout(800);
+      // CRÍTICO: 'domcontentloaded' é mais rápido e falha menos que 'networkidle'
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1500); // Espera um pouco para JS carregar
       await autoScroll(page);
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(500);
 
       let title = null;
       let price = null;
@@ -64,7 +74,7 @@ async function scrapeProduct(url) {
             const parsed = JSON.parse(txt);
             const arr = Array.isArray(parsed) ? parsed : [parsed];
             for (const obj of arr.flat ? arr.flat() : arr) {
-              if (obj && obj['@type'] === 'Product') {
+              if (obj && (obj['@type'] === 'Product' || obj['@type'] === 'ItemPage')) {
                 title = title || (obj.name || obj.headline || null);
                 if (obj.image) image = image || (Array.isArray(obj.image) ? obj.image[0] : obj.image);
                 if (obj.offers) {
@@ -136,6 +146,7 @@ async function scrapeProduct(url) {
       };
     } catch (err) {
       await browser.close();
+      console.error("Scraping error:", err);
       return {
         success: false,
         error: 'Erro no scraping',
@@ -154,6 +165,7 @@ app.post('/scrape', async (req, res) => {
   if (!url) return res.status(400).json({ success: false, error: "URL ausente" });
 
   try {
+    console.log("Scraping URL:", url);
     const result = await scrapeProduct(url);
     return res.json(result);
   } catch (err) {
@@ -161,76 +173,70 @@ app.post('/scrape', async (req, res) => {
   }
 });
 
+// Helper para busca no google
+async function runGoogleSearch(q) {
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  
+  // User Agent aqui também
+  const context = await browser.newContext({ userAgent: USER_AGENT });
+  const page = await context.newPage();
+  
+  try {
+    const url = `https://www.google.com/search?q=${encodeURIComponent(q)}&tbm=shop&hl=pt-BR`;
+    
+    // domcontentloaded aqui também
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    await page.waitForTimeout(1000);
+
+    const items = await page.$$eval('.sh-dgr__content', nodes =>
+      nodes.slice(0, 25).map(n => {
+        const nameEl = n.querySelector('.tAxDx') || n.querySelector('h4') || n.querySelector('.EI11Pd');
+        const priceEl = n.querySelector('.a8Pemb') || n.querySelector('.aULzU');
+        const imgEl = n.querySelector('img');
+        const a = n.querySelector('a');
+        return {
+          name: nameEl ? nameEl.textContent?.trim() : null,
+          price: priceEl ? priceEl.textContent?.trim() : null,
+          imageUrl: imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src') || '') : null,
+          link: a ? a.getAttribute('href') : null
+        };
+      }).filter(x => x.name)
+    );
+
+    const normalized = items.map(i => ({ name: i.name, price: i.price, imageUrl: i.imageUrl, link: i.link ? `https://www.google.com${i.link}` : '' }));
+
+    await browser.close();
+    return { success: true, results: normalized };
+  } catch (err) {
+    await browser.close();
+    throw err;
+  }
+}
+
 // GET /search?q=...
 app.get('/search', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   if (!q) return res.status(400).json({ success: false, error: "Query vazia" });
 
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-  const page = await browser.newPage();
   try {
-    const url = `https://www.google.com/search?q=${encodeURIComponent(q)}&tbm=shop&hl=pt-BR`;
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 20000 });
-    await page.waitForTimeout(1000);
-
-    const items = await page.$$eval('.sh-dgr__content', nodes =>
-      nodes.slice(0, 25).map(n => {
-        const nameEl = n.querySelector('.tAxDx') || n.querySelector('h4') || n.querySelector('.EI11Pd');
-        const priceEl = n.querySelector('.a8Pemb') || n.querySelector('.aULzU');
-        const imgEl = n.querySelector('img');
-        const a = n.querySelector('a');
-        return {
-          name: nameEl ? nameEl.textContent?.trim() : null,
-          price: priceEl ? priceEl.textContent?.trim() : null,
-          imageUrl: imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src') || '') : null,
-          link: a ? a.getAttribute('href') : null
-        };
-      }).filter(x => x.name)
-    );
-
-    const normalized = items.map(i => ({ name: i.name, price: i.price, imageUrl: i.imageUrl, link: i.link ? `https://www.google.com${i.link}` : '' }));
-
-    await browser.close();
-    res.json({ success: true, results: normalized });
+    const result = await runGoogleSearch(q);
+    res.json(result);
   } catch (err) {
-    await browser.close();
+    console.error("Search error:", err);
     res.status(500).json({ success: false, error: "Falha na pesquisa", details: err.message });
   }
 });
 
-// POST /search (compatibilidade front que posta { query })
+// POST /search
 app.post('/search', async (req, res) => {
   const q = (req.body?.query || req.body?.q || '').toString().trim();
   if (!q) return res.status(400).json({ success: false, error: "Query vazia" });
-  // reusar GET /search logic (simplesmente chamar a rota)
+
   try {
-    // call same logic by visiting google
-    const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-    const page = await browser.newPage();
-    const url = `https://www.google.com/search?q=${encodeURIComponent(q)}&tbm=shop&hl=pt-BR`;
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 20000 });
-    await page.waitForTimeout(1000);
-
-    const items = await page.$$eval('.sh-dgr__content', nodes =>
-      nodes.slice(0, 25).map(n => {
-        const nameEl = n.querySelector('.tAxDx') || n.querySelector('h4') || n.querySelector('.EI11Pd');
-        const priceEl = n.querySelector('.a8Pemb') || n.querySelector('.aULzU');
-        const imgEl = n.querySelector('img');
-        const a = n.querySelector('a');
-        return {
-          name: nameEl ? nameEl.textContent?.trim() : null,
-          price: priceEl ? priceEl.textContent?.trim() : null,
-          imageUrl: imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src') || '') : null,
-          link: a ? a.getAttribute('href') : null
-        };
-      }).filter(x => x.name)
-    );
-
-    const normalized = items.map(i => ({ name: i.name, price: i.price, imageUrl: i.imageUrl, link: i.link ? `https://www.google.com${i.link}` : '' }));
-
-    await browser.close();
-    return res.json({ success: true, results: normalized });
+    const result = await runGoogleSearch(q);
+    return res.json(result);
   } catch (err) {
+    console.error("Search POST error:", err);
     return res.status(500).json({ success: false, error: "Falha na pesquisa", details: err.message });
   }
 });
@@ -238,4 +244,3 @@ app.post('/search', async (req, res) => {
 // start
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
-
