@@ -161,7 +161,7 @@ function normalizePrice(raw) {
 }
 
 // -------------------------------------------------------------
-// 🔥 UNIVERSAL PRICE FIXER
+// 🔥 UNIVERSAL PRICE FIXER — VERSÃO CORRIGIDA
 function finalizePrice(allValues) {
   if (!Array.isArray(allValues) || allValues.length === 0) return null;
 
@@ -173,12 +173,10 @@ function finalizePrice(allValues) {
 
   const max = Math.max(...nums);
 
-  const plausible = nums.filter(
-    (n) =>
-      n <= max &&
-      n >= max * 0.2 && // remove valores tipo "33,33" quando o preço verdadeiro é ~150
-      n.toString().split(".")[1]?.length <= 2
-  );
+  const plausible = nums.filter((n) => {
+    if (n >= max * 0.2 && n <= max) return true;
+    return false;
+  });
 
   const final = plausible.length > 0 ? Math.min(...plausible) : max;
 
@@ -216,7 +214,6 @@ async function scrapeProduct(rawUrl) {
 
       const collectXHR = createXHRPriceCollector(page);
 
-      // NAVIGATION --------------------------------------------------------------------
       try {
         await page.goto(cleaned, { waitUntil: "networkidle2", timeout: 60000 });
       } catch {
@@ -227,12 +224,10 @@ async function scrapeProduct(rawUrl) {
       await autoScroll(page);
       await page.waitForTimeout(600);
 
-      // SCRAPING ----------------------------------------------------------------------
       let title = null;
       let image = null;
       let rawPrices = [];
 
-      // JSON-LD
       try {
         const blocks = await page.$$eval(
           'script[type="application/ld+json"]',
@@ -263,14 +258,12 @@ async function scrapeProduct(rawUrl) {
         }
       } catch {}
 
-      // OG ---------------------------------------------
       if (!title)
         title = await page.$eval(`meta[property="og:title"]`, (e) => e.content).catch(() => null);
 
       if (!image)
         image = await page.$eval(`meta[property="og:image"]`, (e) => e.content).catch(() => null);
 
-      // TÍTULO e IMAGEM fallback ------------------------
       if (!title) {
         title = await page.evaluate(() => {
           const sels = ["h1", ".product-title", ".product-name", ".pdp-title"];
@@ -300,7 +293,6 @@ async function scrapeProduct(rawUrl) {
         }
       }
 
-      // PREÇOS HTML -------------------------------------
       const htmlSelectors = [
         "[itemprop='price']",
         ".price",
@@ -324,18 +316,15 @@ async function scrapeProduct(rawUrl) {
         if (shadow?.text) rawPrices.push(shadow.text);
       }
 
-      // PREÇOS XHR ----------------------------------------
       const xhrPrices = collectXHR();
       rawPrices.push(...xhrPrices);
 
-      // FALLBACK TEXTO ------------------------------------
       if (rawPrices.length === 0) {
         const text = await page.evaluate(() => document.body.innerText);
         const m = text.match(/R\$\s?[\d\.,]+/g);
         if (m) rawPrices.push(...m);
       }
 
-      // FINALIZAÇÃO UNIVERSAL ------------------------------
       const finalPrice = finalizePrice(rawPrices);
 
       if (title && typeof title === "string")
