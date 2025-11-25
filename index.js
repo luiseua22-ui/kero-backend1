@@ -5,31 +5,26 @@ import PQueue from "p-queue";
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
-// Plugins
 puppeteer.use(StealthPlugin());
 
-// App
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// Rate limit (protege o backend)
 const limiter = rateLimit({ windowMs: 10 * 1000, max: 30 });
 app.use(limiter);
 
-// Fila de concorrência para evitar muitos browsers simultâneos
 const queue = new PQueue({ concurrency: Number(process.env.SCRAPE_CONCURRENCY) || 2 });
 
-// User-Agent padrão
-const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// Helpers ---------------------------------------------------------
-
+// -------------------------------------------------------------
 function sanitizeIncomingUrl(raw) {
   if (!raw || typeof raw !== "string") return null;
   let s = raw.trim();
 
-  const matches = [...s.matchAll(/https?:\/\/[^\s"']+/gi)].map(m => m[0]);
+  const matches = [...s.matchAll(/https?:\/\/[^\s"']+/gi)].map((m) => m[0]);
   if (matches.length > 0) return matches[0];
 
   if (!/^https?:\/\//i.test(s)) s = "https://" + s;
@@ -41,7 +36,8 @@ function sanitizeIncomingUrl(raw) {
   }
 }
 
-async function autoScroll(page, maxScroll = 2000) {
+// -------------------------------------------------------------
+async function autoScroll(page, maxScroll = 2400) {
   await page.evaluate(async (maxScroll) => {
     await new Promise((resolve) => {
       let total = 0;
@@ -53,11 +49,12 @@ async function autoScroll(page, maxScroll = 2000) {
           clearInterval(timer);
           resolve();
         }
-      }, 150);
+      }, 130);
     });
   }, maxScroll);
 }
 
+// -------------------------------------------------------------
 async function querySelectorShadow(page, selector) {
   return page.evaluate((sel) => {
     function search(root) {
@@ -66,7 +63,7 @@ async function querySelectorShadow(page, selector) {
           const found = root.querySelector(sel);
           if (found) return found;
         }
-        const nodes = (root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []);
+        const nodes = root.querySelectorAll ? Array.from(root.querySelectorAll("*")) : [];
         for (const n of nodes) {
           if (n.shadowRoot) {
             const r = search(n.shadowRoot);
@@ -76,56 +73,77 @@ async function querySelectorShadow(page, selector) {
       } catch (e) {}
       return null;
     }
-    const result = search(document);
-    if (!result) return null;
-    const el = result;
-    if (el.tagName === 'IMG') return { type: 'img', src: el.src || el.currentSrc || null };
-    if (el.tagName === 'META') return { type: 'meta', content: el.content || null };
-    return { type: 'other', text: (el.innerText || el.textContent || '').trim() || null };
+
+    const el = search(document);
+    if (!el) return null;
+
+    if (el.tagName === "IMG") return { type: "img", src: el.src || el.currentSrc || null };
+    if (el.tagName === "META") return { type: "meta", content: el.content || null };
+
+    return { type: "other", text: (el.innerText || el.textContent || "").trim() || null };
   }, selector);
 }
 
+// -------------------------------------------------------------
 function createXHRPriceCollector(page) {
   const prices = [];
-  page.on('response', async (resp) => {
+
+  page.on("response", async (resp) => {
     try {
       const url = resp.url().toLowerCase();
-      if (url.includes('/price') || url.includes('/offers') || url.includes('/product') || url.includes('/pricing') || url.includes('price') || url.includes('item')) {
-        const ctype = resp.headers()['content-type'] || '';
-        if (ctype.includes('application/json')) {
-          const json = await resp.json().catch(() => null);
-          if (json) {
-            const candidates = [];
-            const walk = (o) => {
-              if (!o || typeof o !== 'object') return;
-              for (const k of Object.keys(o)) {
-                const v = o[k];
-                if (k.toLowerCase().includes('price') && (typeof v === 'string' || typeof v === 'number')) candidates.push(String(v));
-                if (k.toLowerCase().includes('amount') && (typeof v === 'string' || typeof v === 'number')) candidates.push(String(v));
-                if (typeof v === 'object') walk(v);
+      if (
+        url.includes("price") ||
+        url.includes("offer") ||
+        url.includes("sku") ||
+        url.includes("product") ||
+        url.includes("pricing")
+      ) {
+        const ctype = resp.headers()["content-type"] || "";
+        if (!ctype.includes("application/json")) return;
+
+        const json = await resp.json().catch(() => null);
+        if (!json) return;
+
+        const candidates = [];
+
+        const walk = (o) => {
+          if (!o || typeof o !== "object") return;
+          for (const k in o) {
+            const v = o[k];
+
+            if (
+              k.toLowerCase().includes("price") ||
+              k.toLowerCase().includes("amount") ||
+              k.toLowerCase().includes("value")
+            ) {
+              if (typeof v === "string" || typeof v === "number") {
+                candidates.push(String(v));
               }
-            };
-            walk(json);
-            candidates.forEach(p => prices.push({ src: url, value: p }));
+            }
+
+            if (typeof v === "object") walk(v);
           }
-        }
+        };
+
+        walk(json);
+
+        candidates.forEach((p) => prices.push(p));
       }
     } catch (e) {}
   });
+
   return () => prices;
 }
 
-// 🔥 NOVA FUNÇÃO DE NORMALIZAÇÃO — PRECISA
+// -------------------------------------------------------------
 function normalizePrice(raw) {
   if (!raw) return null;
 
   let txt = String(raw)
     .replace(/\s+/g, "")
     .replace("R$", "")
-    .replace(/[^0-9.,]/g, "")
-    .trim();
+    .replace(/[^0-9.,]/g, "");
 
-  // Remove pontos usados como separador de milhar
   if (txt.includes(".")) {
     const parts = txt.split(".");
     if (parts.length > 2) {
@@ -136,19 +154,44 @@ function normalizePrice(raw) {
   }
 
   txt = txt.replace(",", ".");
-
   const num = Number(txt);
-  if (isNaN(num) || num === 0) return raw;
 
-  return `R$ ${num.toFixed(2).replace(".", ",")}`;
+  if (isNaN(num) || num === 0) return null;
+  return num;
 }
 
-// MAIN SCRAPER --------------------------------------------------
+// -------------------------------------------------------------
+// 🔥 UNIVERSAL PRICE FIXER
+function finalizePrice(allValues) {
+  if (!Array.isArray(allValues) || allValues.length === 0) return null;
+
+  const nums = allValues
+    .map((p) => normalizePrice(p))
+    .filter((n) => typeof n === "number" && n > 0);
+
+  if (nums.length === 0) return null;
+
+  const max = Math.max(...nums);
+
+  const plausible = nums.filter(
+    (n) =>
+      n <= max &&
+      n >= max * 0.2 && // remove valores tipo "33,33" quando o preço verdadeiro é ~150
+      n.toString().split(".")[1]?.length <= 2
+  );
+
+  const final = plausible.length > 0 ? Math.min(...plausible) : max;
+
+  return `R$ ${final.toFixed(2).replace(".", ",")}`;
+}
+
+// -------------------------------------------------------------
 async function scrapeProduct(rawUrl) {
   return queue.add(async () => {
     const cleaned = sanitizeIncomingUrl(rawUrl);
     console.log("URL RECEBIDA:", rawUrl);
     console.log("URL SANITIZADA:", cleaned);
+
     if (!cleaned) return { success: false, error: "URL inválida" };
 
     const browser = await puppeteer.launch({
@@ -171,156 +214,132 @@ async function scrapeProduct(rawUrl) {
         "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
       });
 
-      const getCollectedPrices = createXHRPriceCollector(page);
+      const collectXHR = createXHRPriceCollector(page);
 
-      let navOk = false;
+      // NAVIGATION --------------------------------------------------------------------
       try {
         await page.goto(cleaned, { waitUntil: "networkidle2", timeout: 60000 });
-        navOk = true;
-      } catch (err1) {
-        console.warn("networkidle2 falhou, tentando domcontentloaded...", err1.message);
-        try {
-          await page.goto(cleaned, { waitUntil: "domcontentloaded", timeout: 90000 });
-          await page.waitForTimeout(1200);
-          navOk = true;
-        } catch (err2) {
-          try {
-            await page.goto(cleaned, { timeout: 60000 });
-            navOk = true;
-          } catch (err3) {
-            await browser.close();
-            return { success: false, error: `Falha ao acessar a URL: ${err3.message}` };
-          }
-        }
+      } catch {
+        await page.goto(cleaned, { waitUntil: "domcontentloaded", timeout: 90000 });
       }
 
-      await page.waitForTimeout(800);
-      await autoScroll(page, 2400);
       await page.waitForTimeout(700);
+      await autoScroll(page);
+      await page.waitForTimeout(600);
 
+      // SCRAPING ----------------------------------------------------------------------
       let title = null;
-      let price = null;
       let image = null;
+      let rawPrices = [];
 
       // JSON-LD
       try {
-        const jsonLdBlocks = await page.$$eval('script[type="application/ld+json"]', nodes =>
-          nodes.map(n => n.textContent).filter(Boolean)
+        const blocks = await page.$$eval(
+          'script[type="application/ld+json"]',
+          (nodes) => nodes.map((n) => n.textContent)
         );
-        for (const block of jsonLdBlocks) {
+
+        for (const block of blocks) {
           try {
             const parsed = JSON.parse(block);
-            const list = Array.isArray(parsed) ? parsed : [parsed];
-            for (const item of list.flat()) {
-              if (!item) continue;
+            const arr = Array.isArray(parsed) ? parsed : [parsed];
+
+            for (const item of arr) {
               if (!title && (item.name || item.title)) title = item.name || item.title;
+
               if (!image && item.image) {
                 const img = Array.isArray(item.image) ? item.image[0] : item.image;
-                image = typeof img === 'object' ? (img.url || img.contentUrl) : img;
+                image = typeof img === "object" ? img.url || img.contentUrl : img;
               }
-              if (!price && item.offers) {
+
+              if (item.offers) {
                 const offers = Array.isArray(item.offers) ? item.offers : [item.offers];
-                const valid = offers.find(o => o.price && parseFloat(String(o.price)) > 0);
-                if (valid) price = valid.price;
+                for (const o of offers) {
+                  if (o.price) rawPrices.push(o.price);
+                }
               }
             }
-          } catch (e){}
+          } catch {}
         }
-      } catch (e) {}
+      } catch {}
 
-      // OpenGraph
+      // OG ---------------------------------------------
+      if (!title)
+        title = await page.$eval(`meta[property="og:title"]`, (e) => e.content).catch(() => null);
+
+      if (!image)
+        image = await page.$eval(`meta[property="og:image"]`, (e) => e.content).catch(() => null);
+
+      // TÍTULO e IMAGEM fallback ------------------------
       if (!title) {
-        title = await page.$eval('meta[property="og:title"]', el => el.content).catch(() => null);
+        title = await page.evaluate(() => {
+          const sels = ["h1", ".product-title", ".product-name", ".pdp-title"];
+          for (const s of sels) {
+            const el = document.querySelector(s);
+            if (el) return (el.innerText || el.textContent).trim();
+          }
+          return null;
+        });
       }
+
       if (!image) {
-        image = await page.$eval('meta[property="og:image"]', el => el.content).catch(() => null);
+        const imgs = [
+          "img#product-image",
+          ".product-image img",
+          ".pdp-image img",
+          ".gallery img",
+          ".image img",
+        ];
+
+        for (const sel of imgs) {
+          const src = await page.$eval(sel, (el) => el.currentSrc || el.src).catch(() => null);
+          if (src) {
+            image = src;
+            break;
+          }
+        }
       }
 
-      // Fallback manual
-      try {
-        if (!title) {
-          const t = await page.evaluate(() => {
-            const s = ['h1', '.product-title', '.product-name', '.pdp-title', '.productTitle'];
-            for (const sel of s) {
-              const el = document.querySelector(sel);
-              if (el) return (el.innerText || el.textContent || '').trim();
-            }
-            return null;
-          });
-          if (t) title = t;
-        }
+      // PREÇOS HTML -------------------------------------
+      const htmlSelectors = [
+        "[itemprop='price']",
+        ".price",
+        ".product-price",
+        ".sales-price",
+        ".best-price",
+        ".valor",
+        ".priceFinal",
+        ".productPrice",
+        ".price--main",
+        ".product-price-amount",
+      ];
 
-        if (!image) {
-          const imgSel = ['img#product-image', '.product-image img', '.pdp-image img', '.gallery img', '.image img'];
-          for (const sel of imgSel) {
-            const src = await page.$eval(sel, el => el.currentSrc || el.src).catch(() => null);
-            if (src) { image = src; break; }
-          }
-        }
+      for (const sel of htmlSelectors) {
+        const txt = await page.$eval(sel, (el) => el.innerText || el.textContent || el.content).catch(
+          () => null
+        );
+        if (txt) rawPrices.push(txt);
 
-        if (!price) {
-          const priceSelectors = [
-            '[itemprop="price"]',
-            '.price',
-            '.product-price',
-            '.sales-price',
-            '.best-price',
-            '.valor',
-            '.priceFinal',
-            '.productPrice',
-            '.price--main',
-            '.product-price-amount'
-          ];
-          for (const sel of priceSelectors) {
-            const txt = await page.$eval(sel, el => el.innerText || el.textContent || el.getAttribute('content')).catch(() => null);
-            if (txt) {
-              price = txt;
-              break;
-            }
-            const shadow = await querySelectorShadow(page, sel).catch(() => null);
-            if (shadow && shadow.text) { price = shadow.text; break; }
-            if (shadow && shadow.src) { image = shadow.src; }
-          }
-        }
-      } catch (e) {}
-
-      // 🔥 NOVA LÓGICA XHR → NUNCA sobrescrever preço existente
-      try {
-        const collected = getCollectedPrices();
-
-        if (!price && collected.length) {
-          const parsedCandidates = collected
-            .map(c => c.value)
-            .filter(v => v && v.length >= 2)
-            .map(v => ({
-              raw: v,
-              num: Number(
-                v.replace(/[^\d.,]/g, "")
-                 .replace(/\.(?=\d{3})/g, "")
-                 .replace(",", ".")
-              )
-            }))
-            .filter(v => !isNaN(v.num) && v.num > 0)
-            .sort((a, b) => b.num - a.num);
-
-          if (parsedCandidates.length) {
-            price = parsedCandidates[0].raw;
-          }
-        }
-      } catch (e) {}
-
-      // fallback final via texto da página
-      if (!price) {
-        const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-        const m = bodyText.match(/R\$\s?[\d\.,]+/);
-        if (m) price = m[0];
+        const shadow = await querySelectorShadow(page, sel);
+        if (shadow?.text) rawPrices.push(shadow.text);
       }
 
-      // limpeza
-      const formattedPrice = normalizePrice(price);
+      // PREÇOS XHR ----------------------------------------
+      const xhrPrices = collectXHR();
+      rawPrices.push(...xhrPrices);
 
-      if (title && typeof title === 'string')
-        title = title.split('|')[0].split('-')[0].trim();
+      // FALLBACK TEXTO ------------------------------------
+      if (rawPrices.length === 0) {
+        const text = await page.evaluate(() => document.body.innerText);
+        const m = text.match(/R\$\s?[\d\.,]+/g);
+        if (m) rawPrices.push(...m);
+      }
+
+      // FINALIZAÇÃO UNIVERSAL ------------------------------
+      const finalPrice = finalizePrice(rawPrices);
+
+      if (title && typeof title === "string")
+        title = title.split("|")[0].split("-")[0].trim();
 
       await browser.close();
 
@@ -328,23 +347,20 @@ async function scrapeProduct(rawUrl) {
         success: true,
         url: cleaned,
         title: title || null,
-        price: formattedPrice || null,
+        price: finalPrice || null,
         image: image || null,
       };
-
     } catch (err) {
-      try { await browser.close(); } catch(e) {}
-      console.error("Erro na tarefa de scraping:", err);
-      return { success: false, error: String(err) };
+      await browser.close().catch(() => {});
+      return { success: false, error: err.message };
     }
   });
 }
 
-// Route: health
-app.get('/healthz', (req, res) => res.json({ ok: true }));
+// -------------------------------------------------------------
+app.get("/healthz", (req, res) => res.json({ ok: true }));
 
-// Route: scrape
-app.post('/scrape', async (req, res) => {
+app.post("/scrape", async (req, res) => {
   try {
     const url = req.body?.url || req.query?.url;
     if (!url) return res.status(400).json({ success: false, error: "URL ausente" });
@@ -352,12 +368,11 @@ app.post('/scrape', async (req, res) => {
     const result = await scrapeProduct(url);
     res.json(result);
   } catch (e) {
-    console.error("Erro na rota /scrape:", e);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// Start
+// -------------------------------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
 
