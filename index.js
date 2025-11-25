@@ -161,7 +161,7 @@ function normalizePrice(raw) {
 }
 
 // -------------------------------------------------------------
-// 🔥 UNIVERSAL PRICE FIXER — VERSÃO CORRIGIDA
+// 🔥 UNIVERSAL PRICE FIXER — AGORA COM FILTRO DE PREÇOS IRREAIS
 function finalizePrice(allValues) {
   if (!Array.isArray(allValues) || allValues.length === 0) return null;
 
@@ -171,14 +171,12 @@ function finalizePrice(allValues) {
 
   if (nums.length === 0) return null;
 
-  const max = Math.max(...nums);
+  // 🔥 FILTRANDO PREÇOS IRREAIS (RESOLVE Riachuelo E QUALQUER OUTRO SITE)
+  const realistic = nums.filter((n) => n >= 1 && n <= 20000);
 
-  const plausible = nums.filter((n) => {
-    if (n >= max * 0.2 && n <= max) return true;
-    return false;
-  });
+  const finalList = realistic.length > 0 ? realistic : nums;
 
-  const final = plausible.length > 0 ? Math.min(...plausible) : max;
+  const final = Math.min(...finalList);
 
   return `R$ ${final.toFixed(2).replace(".", ",")}`;
 }
