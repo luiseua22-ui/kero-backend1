@@ -161,12 +161,11 @@ function normalizePrice(raw) {
 }
 
 // -------------------------------------------------------------
-// 🔥 REIMPLEMENTAÇÃO ROBUSTA do finalizePrice
-// usa scoring: prefira JSON-LD / meta / seletores principais / XHR / formato consistente / frequência
-function finalizePrice(allValues) {
+// finalizePrice agora recebe optional proximityMap (do page.evaluate)
+// proximityMap: { "<rawCandidateString>": { near: bool, count: number } }
+function finalizePrice(allValues, proximityMap = {}) {
   if (!Array.isArray(allValues) || allValues.length === 0) return null;
 
-  // normalize and keep original raw strings for scoring
   const candidates = allValues
     .map((raw) => {
       const rawStr = raw == null ? "" : String(raw).trim();
@@ -177,71 +176,73 @@ function finalizePrice(allValues) {
 
   if (candidates.length === 0) return null;
 
-  // frequency map based on normalized numeric value (stringified)
+  // frequency map for numeric values
   const freq = {};
   for (const c of candidates) {
     const key = c.num.toFixed(2);
     freq[key] = (freq[key] || 0) + 1;
   }
 
-  // scoring function
+  // scoring function with proximityMap boost
   const scoreFor = (cand) => {
     let score = 0;
     const raw = cand.raw.toLowerCase();
 
-    // 1) Source hints in the raw string
-    // If raw contains explicit currency or BRL mention -> strong signal
+    // strong signal if explicit currency mention
     if (/\br\$/.test(raw) || /\bbrl\b/.test(raw)) score += 6;
 
-    // If raw looks like meta amount (pure number) less weight
-    if (/^[\d\.,]+$/.test(raw)) score += 1;
+    // clean numeric-only low weight
+    if (/^[\d\.,]+$/.test(cand.raw)) score += 1;
 
-    // If raw contains words like 'de', 'por', 'à vista', 'à vista' maybe indicates final/discount
-    if (/\b(vista|de|por|agora|oferta|desconto|promo|preço)\b/.test(raw)) score += 2;
-
-    // 2) Format quality: BR format with thousands and cents (e.g., 1.234,56)
+    // format quality: BR thousands + 2 decimals
     if (/^\d{1,3}(?:\.\d{3})*,\d{2}$/.test(cand.raw)) score += 5;
 
-    // 3) Decimal presence (has cents) is a good sign
+    // presence of cents (+)
     if (/[,\.]\d{2}$/.test(cand.raw)) score += 3;
 
-    // 4) If raw contains "installment" or "parcela" penalize slightly (often not total)
+    // indicators of promo/à vista (+)
+    if (/\b(vista|de|por|agora|oferta|desconto|promo|preço)\b/.test(raw)) score += 2;
+
+    // penalize installment indications
     if (/parcela|parcelas|installment|juros/.test(raw)) score -= 3;
 
-    // 5) Very small numbers (<2) are suspect but may be valid; penalize lightly
-    if (cand.num < 2) score -= 2;
-
-    // 6) Very large numbers are suspect; penalize (but not absolute block)
+    // penalize huge numbers slightly
     if (cand.num > 100000) score -= 6;
     else if (cand.num > 20000) score -= 3;
 
-    // 7) Frequency boost: values that appear multiple times (from different sources) are more reliable
+    // frequency boost
     const f = freq[cand.num.toFixed(2)] || 0;
-    score += Math.min(f, 5) * 2; // up to +10
+    score += Math.min(f, 5) * 2;
 
-    // 8) If raw contains many digits without separators (likely ID) penalize
+    // penalize raw strings that look like long IDs (many digits no separators)
     if (/^\d{5,}$/.test(cand.raw.replace(/[^\d]/g, "")) && !/[.,]/.test(cand.raw)) score -= 5;
+
+    // PROXIMITY BOOST from page analysis
+    const prox = proximityMap[cand.raw];
+    if (prox) {
+      if (prox.near) score += 10;            // very strong if appears near title/image
+      score += Math.min(prox.count, 5) * 1.5; // small boost for occurrences
+    }
+
+    // slightly penalize tiny numbers (but not block)
+    if (cand.num < 1) score -= 2;
 
     return score;
   };
 
-  // compute scores
   const scored = candidates.map((c) => ({ ...c, score: scoreFor(c) }));
 
-  // sort by score desc, tie-breaker by occurrence frequency then by closeness to median
   scored.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     const fa = freq[a.num.toFixed(2)] || 0;
     const fb = freq[b.num.toFixed(2)] || 0;
     if (fb !== fa) return fb - fa;
-    return a.num - b.num; // prefer lower price if everything else equal
+    return a.num - b.num;
   });
 
-  // top candidate(s)
   const topScore = scored[0].score;
   const topCandidates = scored.filter((s) => s.score === topScore);
 
-  // if multiple top candidates, pick the one with the most occurrences, then the smallest numeric (to match "best price")
   topCandidates.sort((a, b) => {
     const fa = freq[a.num.toFixed(2)] || 0;
     const fb = freq[b.num.toFixed(2)] || 0;
@@ -250,8 +251,6 @@ function finalizePrice(allValues) {
   });
 
   const chosen = topCandidates[0];
-
-  // final formatting to BR currency
   const final = chosen.num;
   return `R$ ${final.toFixed(2).replace(".", ",")}`;
 }
@@ -406,8 +405,96 @@ async function scrapeProduct(rawUrl) {
         if (m) rawPrices.push(...m);
       }
 
-      // FINALIZAÇÃO UNIVERSAL ------------------------------
-      const finalPrice = finalizePrice(rawPrices);
+      // ====== NOVO: análise de proximidade no DOM para cada candidato ======
+      const uniqueCandidates = Array.from(new Set(rawPrices.map((r) => (r == null ? "" : String(r).trim()))));
+
+      // run in page: for each candidate string, check occurrences and proximity to title/image elements
+      const proximityInfo = await page.evaluate(
+        (candidates, titleText, imageUrl) => {
+          const info = {};
+          candidates.forEach((c) => {
+            info[c] = { near: false, count: 0 };
+          });
+
+          // find title elements (try to match by text)
+          const titleEls = [];
+          if (titleText && titleText.trim().length > 0) {
+            const possible = Array.from(document.querySelectorAll("h1, .product-title, .product-name, .pdp-title"));
+            for (const el of possible) {
+              try {
+                if ((el.innerText || el.textContent || "").trim().includes(titleText.trim())) titleEls.push(el);
+              } catch (e) {}
+            }
+          }
+
+          // find image elements (match src contains imageUrl)
+          const imageEls = [];
+          if (imageUrl && imageUrl.trim().length > 0) {
+            const imgs = Array.from(document.querySelectorAll("img"));
+            for (const im of imgs) {
+              try {
+                const src = im.currentSrc || im.src || "";
+                if (src && src.includes(imageUrl)) imageEls.push(im);
+              } catch (e) {}
+            }
+          }
+
+          // any context elements to consider as product area
+          const contextEls = [...titleEls, ...imageEls];
+
+          // helper to check proximity: returns true if two elements share an ancestor within depth levels
+          function nearEachOther(node, ctxs, maxDepth = 6) {
+            if (!node || !ctxs || ctxs.length === 0) return false;
+            for (const ctx of ctxs) {
+              // quick contains check
+              if (ctx.contains(node) || node.contains(ctx)) return true;
+              // climb up from node and check if we hit ctx or a common ancestor
+              let a = node;
+              for (let i = 0; i < maxDepth && a; i++) {
+                if (a === ctx) return true;
+                a = a.parentElement;
+              }
+              // climb up from ctx and check
+              a = ctx;
+              for (let i = 0; i < maxDepth && a; i++) {
+                if (a === node) return true;
+                a = a.parentElement;
+              }
+            }
+            return false;
+          }
+
+          // search the DOM for nodes that contain candidate text (simple contains)
+          for (const cand of candidates) {
+            if (!cand || cand.trim().length === 0) continue;
+            const nodes = Array.from(document.querySelectorAll("body *")).filter((n) => {
+              try {
+                const t = (n.innerText || n.textContent || "");
+                return t && t.includes(cand);
+              } catch (e) { return false; }
+            });
+            info[cand].count = nodes.length;
+            if (contextEls.length === 0) {
+              // if we don't have title/image anchors, assume proximity unknown (leave near=false)
+              continue;
+            }
+            for (const n of nodes) {
+              if (nearEachOther(n, contextEls, 6)) {
+                info[cand].near = true;
+                break;
+              }
+            }
+          }
+
+          return info;
+        },
+        uniqueCandidates,
+        title || "",
+        image || ""
+      );
+
+      // FINALIZAÇÃO UNIVERSAL (agora com proximityInfo)
+      const finalPrice = finalizePrice(rawPrices, proximityInfo);
 
       if (title && typeof title === "string")
         title = title.split("|")[0].split("-")[0].trim();
