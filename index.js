@@ -19,16 +19,14 @@ const queue = new PQueue({ concurrency: Number(process.env.SCRAPE_CONCURRENCY) |
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// -------------------------------------------------------------
+// ---------------- helpers ----------------
+
 function sanitizeIncomingUrl(raw) {
   if (!raw || typeof raw !== "string") return null;
   let s = raw.trim();
-
   const matches = [...s.matchAll(/https?:\/\/[^\s"']+/gi)].map((m) => m[0]);
   if (matches.length > 0) return matches[0];
-
   if (!/^https?:\/\//i.test(s)) s = "https://" + s;
-
   try {
     return new URL(s).toString();
   } catch (e) {
@@ -36,7 +34,6 @@ function sanitizeIncomingUrl(raw) {
   }
 }
 
-// -------------------------------------------------------------
 async function autoScroll(page, maxScroll = 2400) {
   await page.evaluate(async (maxScroll) => {
     await new Promise((resolve) => {
@@ -54,7 +51,6 @@ async function autoScroll(page, maxScroll = 2400) {
   }, maxScroll);
 }
 
-// -------------------------------------------------------------
 async function querySelectorShadow(page, selector) {
   return page.evaluate((sel) => {
     function search(root) {
@@ -73,21 +69,17 @@ async function querySelectorShadow(page, selector) {
       } catch (e) {}
       return null;
     }
-
     const el = search(document);
     if (!el) return null;
-
     if (el.tagName === "IMG") return { type: "img", src: el.src || el.currentSrc || null };
     if (el.tagName === "META") return { type: "meta", content: el.content || null };
-
     return { type: "other", text: (el.innerText || el.textContent || "").trim() || null };
   }, selector);
 }
 
-// -------------------------------------------------------------
+// ---------------- collect XHR but tag source ----------------
 function createXHRPriceCollector(page) {
-  const prices = [];
-
+  const prices = []; // will store objects { raw, source }
   page.on("response", async (resp) => {
     try {
       const url = resp.url().toLowerCase();
@@ -100,261 +92,230 @@ function createXHRPriceCollector(page) {
       ) {
         const ctype = resp.headers()["content-type"] || "";
         if (!ctype.includes("application/json")) return;
-
         const json = await resp.json().catch(() => null);
         if (!json) return;
-
-        const candidates = [];
-
         const walk = (o) => {
           if (!o || typeof o !== "object") return;
-          for (const k in o) {
+          for (const k of Object.keys(o)) {
             const v = o[k];
-
-            if (
-              k.toLowerCase().includes("price") ||
-              k.toLowerCase().includes("amount") ||
-              k.toLowerCase().includes("value")
-            ) {
+            if (k.toLowerCase().includes("price") || k.toLowerCase().includes("amount") || k.toLowerCase().includes("value")) {
               if (typeof v === "string" || typeof v === "number") {
-                candidates.push(String(v));
+                prices.push({ raw: String(v), source: "xhr" });
               }
             }
-
             if (typeof v === "object") walk(v);
           }
         };
-
         walk(json);
-
-        candidates.forEach((p) => prices.push(p));
       }
     } catch (e) {}
   });
-
   return () => prices;
 }
 
-// -------------------------------------------------------------
-// NORMALIZAÇÃO ROBUSTA DE PREÇOS
+// ---------------- robust normalization ----------------
 function normalizePrice(raw) {
   if (raw === null || raw === undefined) return null;
   let s = String(raw).trim();
+  if (!s) return null;
+
+  // keep original for checks
+  const original = s;
+
+  // remove NBSP and currency markers
+  s = s.replace(/\u00A0/g, " ");
+  s = s.replace(/(r\$\s?)/i, "");
+  s = s.replace(/(brl)/i, "");
+  s = s.replace(/[^\d.,]/g, ""); // keep digits, commas, dots
 
   if (!s) return null;
 
-  // se JSON numérico (ex: 590400 ou 5904)
+  // If pure digits (like "590400" or "7904"), decide heuristics:
   if (/^\d+$/.test(s)) {
-    // número inteiro puro: pode ser cents (590400) ou reais (5904)
     const asInt = Number(s);
-    if (asInt > 10000) {
-      // tenta interpretar como centavos (divide por 100) se isso produzir valor plausível
+    if (asInt > 100000) {
+      // likely cents -> divide by 100
       return asInt / 100;
     }
+    // ambiguous: if between 1000 and 99999 could be reais without separators
+    // but we keep as-is (e.g., 7904 => 7904.00) and allow scoring to decide
     return asInt;
   }
 
-  // remover rótulos de moeda e espaços estranhos
-  s = s.replace(/\u00A0/g, " "); // nbsp
-  s = s.replace(/(r\$\s?)/i, "");
-  s = s.replace(/(brl)/i, "");
-  s = s.replace(/[^\d.,]/g, ""); // deixar apenas dígitos e separadores
-
-  if (!s) return null;
-
-  // captura padrão com agrupamentos: exemplo "1.234,56" ou "5,904.00" ou "5904,00"
-  const candidate = s.match(/^\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?$/);
-  const rawHasBoth = s.indexOf(",") !== -1 && s.indexOf(".") !== -1;
-
-  let normalized = null;
-
-  if (candidate) {
-    // decidir qual separador é decimal: o último separator provavelmente é decimal
-    if (rawHasBoth) {
-      const lastComma = s.lastIndexOf(",");
-      const lastDot = s.lastIndexOf(".");
-      if (lastComma > lastDot) {
-        // ',' decimal, '.' milhares
-        normalized = s.replace(/\./g, "").replace(",", ".");
-      } else {
-        // '.' decimal, ',' milhares
-        normalized = s.replace(/,/g, "");
-      }
-    } else if (s.indexOf(",") !== -1 && s.indexOf(".") === -1) {
-      // só vírgula presente: assume vírgula decimal se parte após vírgula tem 1-2 dígitos,
-      // ou milhares se o grupo antes contém separadores esperados.
-      const parts = s.split(",");
-      if (parts.length === 2 && parts[1].length <= 2) {
-        normalized = s.replace(/\./g, "").replace(",", ".");
-      } else {
-        // caso raro: "1,000" pode ser 1000 ou 1.00; assumimos milhares -> remove vírgulas
-        normalized = s.replace(/,/g, "");
-      }
-    } else if (s.indexOf(".") !== -1 && s.indexOf(",") === -1) {
-      // só ponto presente: se parte após ponto tem 2 dígitos assumimos decimal, senão milhares
-      const parts = s.split(".");
-      if (parts.length === 2 && parts[1].length === 2) {
-        normalized = s.replace(/,/g, "");
-      } else {
-        // ex: "5.904" possivelmente 5904 (thousand separator) — removemos pontos
-        normalized = s.replace(/\./g, "");
-      }
+  // If both dot and comma exist, the last separator is most likely decimal.
+  if (s.indexOf(".") !== -1 && s.indexOf(",") !== -1) {
+    const lastComma = s.lastIndexOf(",");
+    const lastDot = s.lastIndexOf(".");
+    if (lastComma > lastDot) {
+      // comma decimal, dot thousands
+      s = s.replace(/\./g, "").replace(",", ".");
     } else {
-      normalized = s;
+      // dot decimal, comma thousands -> remove commas
+      s = s.replace(/,/g, "");
     }
-  } else {
-    // padrão simples: retirar tudo que não é número, vírgula ou ponto
-    normalized = s.replace(/[^\d.,]/g, "");
+  } else if (s.indexOf(",") !== -1 && s.indexOf(".") === -1) {
+    // only comma present: if decimals length <=2 after comma => decimal
+    const parts = s.split(",");
+    if (parts.length === 2 && parts[1].length <= 2) {
+      s = s.replace(/\./g, "").replace(",", ".");
+    } else {
+      // ambiguous e.g. "1,000" -> treat as thousands separator
+      s = s.replace(/,/g, "");
+    }
+  } else if (s.indexOf(".") !== -1 && s.indexOf(",") === -1) {
+    // only dot present: if last part two digits likely decimal else thousands
+    const parts = s.split(".");
+    if (parts.length === 2 && parts[1].length === 2) {
+      // decimal
+      // keep dot as decimal
+    } else {
+      // remove dots as thousands separators
+      s = s.replace(/\./g, "");
+    }
   }
 
-  if (!normalized) return null;
-
-  // agora substituir vírgula por ponto se houver vírgula decimal
-  // normalizing: already replaced thousands. Ensure only one dot decimal separator
-  const dots = (normalized.match(/\./g) || []).length;
-  const commas = (normalized.match(/,/g) || []).length;
-
-  // if both present after previous logic, fallback: take last separator as decimal
-  if (dots > 1 && commas === 0) {
-    // remove all dots except last two digits decimal pattern
-    // fallback: remove all dots
-    normalized = normalized.replace(/\./g, "");
-  }
-
-  // finally unify to dot decimal
-  normalized = normalized.replace(",", ".");
-
-  // parse
-  const num = Number(normalized);
+  // final replace comma with dot (if any)
+  s = s.replace(",", ".");
+  const num = Number(s);
   if (isNaN(num)) return null;
 
-  // Heurística para valores em centavos vindos como inteiro enorme (ex: 590400 -> 5904)
+  // heuristic: if original looked like integer large and num > 100000 then maybe cents -> divide by 100
   if (num > 100000 && Number.isInteger(num)) {
-    // tenta dividir por 100 se isso produzir um valor razoável comparado ao próprio
-    const maybe = num / 100;
-    if (maybe < num && maybe > 0) return maybe;
+    const possible = num / 100;
+    return possible;
   }
 
   return num;
 }
 
-// -------------------------------------------------------------
-// finalizePrice com suporte a proximityMap e heurísticas extras
-function finalizePrice(allValues, proximityMap = {}) {
-  if (!Array.isArray(allValues) || allValues.length === 0) return null;
+// ---------------- scoring + finalize with source weighting ----------------
+function finalizePrice(candidatesArray, proximityMap = {}) {
+  // candidatesArray: array of objects { raw, source } OR strings
+  if (!Array.isArray(candidatesArray) || candidatesArray.length === 0) return null;
 
-  // montar candidatos com origem e contagem aproximada
-  const rawList = allValues.map((v) => (v == null ? "" : String(v).trim())).filter(Boolean);
+  // normalize input into objects with source
+  const rawObjs = candidatesArray.map((c) => {
+    if (!c) return null;
+    if (typeof c === "string") return { raw: c, source: "unknown" };
+    // if object maybe already {raw, source}
+    const raw = c.raw != null ? String(c.raw) : "";
+    const source = c.source || "unknown";
+    return { raw, source };
+  }).filter(Boolean);
 
-  // debug log
-  console.log("RAW PRICES (entrada):", rawList);
-
-  const candidates = rawList
-    .map((raw) => {
-      const num = normalizePrice(raw);
-      return { raw, num };
-    })
-    .filter((c) => c.num !== null);
-
-  if (candidates.length === 0) {
-    console.log("FINALIZE: nenhum candidato numérico válido encontrado.");
-    return null;
+  // collapse identical raw strings but keep sources aggregated
+  const map = new Map(); // raw -> { raw, sources: Set, count }
+  for (const o of rawObjs) {
+    const r = o.raw.trim();
+    if (!map.has(r)) map.set(r, { raw: r, sources: new Set(), count: 0 });
+    const entry = map.get(r);
+    entry.sources.add(o.source || "unknown");
+    entry.count += 1;
   }
 
-  // adicionar possíveis ajustes: se um candidato parece centavos inteiros (ex: 590400) já tratado no normalizePrice,
-  // mas para robustez, também adicionamos versões ajustadas (num/100) se isso produzir números plausíveis.
-  const extended = [];
-  for (const c of candidates) {
-    extended.push(c);
-    if (c.num > 1000 && Number.isInteger(c.num)) {
-      const divided = c.num / 100;
-      if (divided > 0 && divided < c.num) {
-        extended.push({ raw: c.raw + " (ajuste/100)", num: divided });
-      }
-    }
+  const entries = Array.from(map.values()).map((e) => {
+    e.num = normalizePrice(e.raw);
+    return e;
+  }).filter(e => e.num !== null && Number.isFinite(e.num));
+
+  if (entries.length === 0) return null;
+
+  // build frequency by numeric string
+  const freqNum = {};
+  for (const e of entries) {
+    const key = e.num.toFixed(2);
+    freqNum[key] = (freqNum[key] || 0) + e.count;
   }
 
-  // frequency map by normalized numeric string (to boost repeated values)
-  const freq = {};
-  for (const c of extended) {
-    const key = c.num.toFixed(2);
-    freq[key] = (freq[key] || 0) + 1;
+  // compute median scale to identify suspicious outliers
+  const nums = [...new Set(entries.map(e => e.num))].sort((a,b)=>a-b);
+  let median = null;
+  if (nums.length > 0) {
+    const mid = Math.floor(nums.length / 2);
+    median = nums.length % 2 === 1 ? nums[mid] : (nums[mid-1] + nums[mid]) / 2;
   }
 
-  // compute median to know scale
-  const nums = Array.from(new Set(extended.map((c) => c.num))).sort((a, b) => a - b);
-  const median = nums.length % 2 === 1 ? nums[(nums.length - 1) / 2] : (nums[nums.length/2 -1] + nums[nums.length/2]) / 2;
-
-  // scoring
-  const scoreFor = (c) => {
+  // scoring function
+  const scoreEntry = (e) => {
     let score = 0;
-    const raw = c.raw.toLowerCase();
+    const raw = e.raw.toLowerCase();
 
-    // presence of currency symbol or explicit 'r$' is strong
-    if (/\br\$/.test(raw) || /\bbrl\b/.test(raw)) score += 10;
+    // SOURCE weight: strong preference to jsonld/meta/selector > xhr > body/unknown
+    if (e.sources.has("jsonld")) score += 30;
+    if (e.sources.has("meta")) score += 20;
+    if (e.sources.has("selector")) score += 18;
+    if (e.sources.has("selector-visible")) score += 22; // visible selector near title/image
+    if (e.sources.has("xhr")) score += 10;
+    if (e.sources.has("body")) score += 2;
+    if (e.sources.has("unknown")) score += 0;
 
-    // if raw contains words like 'preço', 'à vista', 'oferta' small boost
-    if (/\b(preço|preco|à vista|a vista|vista|oferta|desconto|promo)\b/.test(raw)) score += 3;
+    // explicit currency mention in raw
+    if (/\br\$/.test(raw) || /\bbrl\b/.test(raw)) score += 6;
 
-    // format: thousands + cents (1.234,56) strong
-    if (/^\d{1,3}(?:\.\d{3})*,\d{2}$/.test(c.raw)) score += 6;
+    // good formatting: thousands + cents
+    if (/^\d{1,3}(?:\.\d{3})*,\d{2}$/.test(e.raw)) score += 8;
 
-    // if has cents (.,xx or ,xx)
-    if (/[,\.]\d{2}$/.test(c.raw)) score += 4;
+    // centavos presence
+    if (/[,\.]\d{2}$/.test(e.raw)) score += 4;
 
-    // penalize explicit installments or strings with 'parcela'
-    if (/parcela|parcelas|installment|juros/.test(raw)) score -= 5;
+    // penalize installments
+    if (/parcela|parcelas|installment|juros/.test(raw)) score -= 8;
 
-    // penalize long digit-only strings (likely IDs)
-    const digitsOnly = c.raw.replace(/[^\d]/g, "");
-    if (/^\d{6,}$/.test(digitsOnly) && !/[.,]/.test(c.raw)) score -= 8;
+    // penalize long digit-only strings (IDs)
+    const digitsOnly = e.raw.replace(/[^\d]/g, "");
+    if (/^\d{6,}$/.test(digitsOnly) && !/[.,]/.test(e.raw)) score -= 10;
 
-    // frequency helps
-    const f = freq[c.num.toFixed(2)] || 0;
-    score += Math.min(f, 5) * 2;
+    // frequency boost (appearances)
+    const f = freqNum[e.num.toFixed(2)] || 0;
+    score += Math.min(f, 6) * 3;
 
-    // proximity boost (near title/image)
-    const prox = proximityMap[c.raw];
+    // proximity boost from proximityMap if present (map keys are raw strings)
+    const prox = proximityMap[e.raw];
     if (prox) {
-      if (prox.near) score += 12;
-      score += Math.min(prox.count || 0, 5) * 1.5;
+      if (prox.near) score += 18;
+      score += Math.min(prox.count || 0, 5) * 2;
     }
 
-    // scale coherence: if candidate is close to median add small score
+    // coherence with median
     if (median && median > 0) {
-      const ratio = c.num / median;
-      // prefer candidates within 0.2x - 5x of median
+      const ratio = e.num / median;
       if (ratio >= 0.2 && ratio <= 5) score += 2;
-      // if candidate enormously smaller than median, penalize a bit (likely parcel or ID)
-      if (ratio < 0.05) score -= 6;
+      if (ratio < 0.03) score -= 6; // far too small
+      if (ratio > 20) score -= 6; // far too large
     }
 
-    // small numbers (<1) penalize lightly
-    if (c.num < 1) score -= 4;
+    // small numbers penalty but not absolute
+    if (e.num < 1) score -= 6;
 
     return score;
   };
 
-  const scored = extended.map((c) => ({ ...c, score: scoreFor(c) }));
+  const scored = entries.map(e => ({ ...e, score: scoreEntry(e) }));
 
-  scored.sort((a, b) => {
+  // sort by score desc, tiebreaker by frequency then numeric closeness to median
+  scored.sort((a,b) => {
     if (b.score !== a.score) return b.score - a.score;
-    const fa = freq[a.num.toFixed(2)] || 0;
-    const fb = freq[b.num.toFixed(2)] || 0;
+    const fa = freqNum[a.num.toFixed(2)] || 0;
+    const fb = freqNum[b.num.toFixed(2)] || 0;
     if (fb !== fa) return fb - fa;
+    // prefer value closer to median
+    if (median !== null) {
+      return Math.abs(a.num - median) - Math.abs(b.num - median);
+    }
     return a.num - b.num;
   });
 
-  console.log("CANDIDATES SCORED:", scored.slice(0, 10));
+  // debug logging for you
+  console.log("RAW_CANDIDATES:", entries.map(e => ({ raw: e.raw, num: e.num, sources: Array.from(e.sources), count: e.count })));
+  console.log("SCORED_CANDIDATES:", scored.map(s => ({ raw: s.raw, num: s.num, score: s.score, sources: Array.from(s.sources) })));
 
   const best = scored[0];
   if (!best) return null;
-
-  const final = best.num;
-  return `R$ ${final.toFixed(2).replace(".", ",")}`;
+  return `R$ ${best.num.toFixed(2).replace(".", ",")}`;
 }
 
-// -------------------------------------------------------------
+// ---------------- main scraper ----------------
+
 async function scrapeProduct(rawUrl) {
   return queue.add(async () => {
     const cleaned = sanitizeIncomingUrl(rawUrl);
@@ -385,7 +346,7 @@ async function scrapeProduct(rawUrl) {
 
       const collectXHR = createXHRPriceCollector(page);
 
-      // NAVIGATION --------------------------------------------------------------------
+      // NAVIGATION
       try {
         await page.goto(cleaned, { waitUntil: "networkidle2", timeout: 60000 });
       } catch {
@@ -396,50 +357,98 @@ async function scrapeProduct(rawUrl) {
       await autoScroll(page);
       await page.waitForTimeout(600);
 
-      // SCRAPING ----------------------------------------------------------------------
       let title = null;
       let image = null;
-      let rawPrices = [];
+      const rawCandidates = []; // will contain objects { raw, source }
 
-      // JSON-LD
+      // 1) JSON-LD (source = jsonld)
       try {
-        const blocks = await page.$$eval(
-          'script[type="application/ld+json"]',
-          (nodes) => nodes.map((n) => n.textContent)
-        );
-
+        const blocks = await page.$$eval('script[type="application/ld+json"]', nodes => nodes.map(n => n.textContent).filter(Boolean));
         for (const block of blocks) {
           try {
             const parsed = JSON.parse(block);
             const arr = Array.isArray(parsed) ? parsed : [parsed];
-
-            for (const item of arr) {
+            for (const item of arr.flat()) {
+              if (!item) continue;
               if (!title && (item.name || item.title)) title = item.name || item.title;
-
               if (!image && item.image) {
                 const img = Array.isArray(item.image) ? item.image[0] : item.image;
                 image = typeof img === "object" ? img.url || img.contentUrl : img;
               }
-
               if (item.offers) {
                 const offers = Array.isArray(item.offers) ? item.offers : [item.offers];
                 for (const o of offers) {
-                  if (o.price) rawPrices.push(o.price);
+                  if (o.price) rawCandidates.push({ raw: String(o.price), source: "jsonld" });
                 }
               }
             }
-          } catch {}
+          } catch (e) { /* ignore parse errors */ }
         }
-      } catch {}
+      } catch (e) {}
 
-      // OG ---------------------------------------------
-      if (!title)
-        title = await page.$eval(`meta[property="og:title"]`, (e) => e.content).catch(() => null);
+      // 2) OpenGraph meta (source = meta)
+      if (!title) {
+        const ogTitle = await page.$eval('meta[property="og:title"]', e => e.content).catch(() => null);
+        if (ogTitle) title = ogTitle;
+      }
+      const ogImage = await page.$eval('meta[property="og:image"]', e => e.content).catch(() => null);
+      if (ogImage) {
+        if (!image) image = ogImage;
+      }
 
-      if (!image)
-        image = await page.$eval(`meta[property="og:image"]`, (e) => e.content).catch(() => null);
+      // 3) selectors visible (source = selector or selector-visible)
+      // collect price-like selectors and tag as 'selector' (later we'll mark 'selector-visible' if near title/image)
+      const selectorList = [
+        { sel: "[itemprop='price']", name: "itemprop_price" },
+        { sel: ".price", name: "class_price" },
+        { sel: ".product-price", name: "product-price" },
+        { sel: ".sales-price", name: "sales-price" },
+        { sel: ".best-price", name: "best-price" },
+        { sel: ".valor", name: "valor" },
+        { sel: ".priceFinal", name: "priceFinal" },
+        { sel: ".productPrice", name: "productPrice" },
+        { sel: ".price--main", name: "price--main" },
+        { sel: ".product-price-amount", name: "product-price-amount" },
+        { sel: "meta[property='product:price:amount']", name: "meta_price_amount" }
+      ];
 
-      // TÍTULO e IMAGEM fallback ------------------------
+      for (const it of selectorList) {
+        const values = await page.$$eval(it.sel, els => els.map(el => {
+          try {
+            if (el.tagName === "META") return el.getAttribute("content") || null;
+            return (el.innerText || el.textContent || el.getAttribute("content") || "").trim();
+          } catch (e) { return null; }
+        }).filter(Boolean)).catch(()=>[]);
+        for (const v of values) rawCandidates.push({ raw: String(v), source: "selector" });
+      }
+
+      // 4) search common image selectors
+      if (!image) {
+        const imgCandidates = [
+          "img#product-image",
+          ".product-image img",
+          ".pdp-image img",
+          ".gallery img",
+          ".image img"
+        ];
+        for (const sel of imgCandidates) {
+          const src = await page.$eval(sel, el => el.currentSrc || el.src).catch(()=>null);
+          if (src) { image = src; break; }
+        }
+      }
+
+      // 5) XHR collected: already objects {raw, source: 'xhr'}
+      const xhr = collectXHR();
+      for (const o of xhr) rawCandidates.push(o);
+
+      // 6) Fallback: scan body text for R$ patterns (tag as 'body')
+      const bodyText = await page.evaluate(() => document.body.innerText).catch(()=>"");
+      if (bodyText) {
+        const matches = Array.from(new Set((bodyText.match(/R\$\s?[\d\.,]+/g) || []).map(s => s.trim())));
+        for (const m of matches) rawCandidates.push({ raw: m, source: "body" });
+      }
+
+      // 7) If still no title, fallback to visible selectors
       if (!title) {
         title = await page.evaluate(() => {
           const sels = ["h1", ".product-title", ".product-name", ".pdp-title"];
@@ -448,145 +457,115 @@ async function scrapeProduct(rawUrl) {
             if (el) return (el.innerText || el.textContent).trim();
           }
           return null;
-        });
+        }).catch(()=>null);
       }
 
-      if (!image) {
-        const imgs = [
-          "img#product-image",
-          ".product-image img",
-          ".pdp-image img",
-          ".gallery img",
-          ".image img",
-        ];
+      // make unique by raw string but keep sources aggregated
+      const aggregated = new Map(); // raw -> { raw, sources:Set, count }
+      for (const c of rawCandidates) {
+        if (!c || !c.raw) continue;
+        const r = String(c.raw).trim();
+        if (!r) continue;
+        if (!aggregated.has(r)) aggregated.set(r, { raw: r, sources: new Set(), count: 0 });
+        const e = aggregated.get(r);
+        e.sources.add(c.source || "unknown");
+        e.count += 1;
+      }
 
-        for (const sel of imgs) {
-          const src = await page.$eval(sel, (el) => el.currentSrc || el.src).catch(() => null);
-          if (src) {
-            image = src;
-            break;
+      // prepare array for proximity check keys
+      const uniqueRawList = Array.from(aggregated.keys());
+
+      // 8) proximity analysis to detect visible prices near title/image
+      // returns map { "<raw>": { near: bool, count: n } }
+      const proximityInfo = await page.evaluate((candidates, titleText, imageUrl) => {
+        const info = {};
+        candidates.forEach(c => { info[c] = { near: false, count: 0 }; });
+
+        const titleEls = [];
+        if (titleText && titleText.trim().length>0) {
+          const poss = Array.from(document.querySelectorAll("h1, .product-title, .product-name, .pdp-title"));
+          for (const el of poss) {
+            try { if ((el.innerText||el.textContent||"").trim().includes(titleText.trim())) titleEls.push(el); } catch(e) {}
           }
+        }
+        const imageEls = [];
+        if (imageUrl && imageUrl.trim().length>0) {
+          const imgs = Array.from(document.querySelectorAll("img"));
+          for (const im of imgs) {
+            try { const src = im.currentSrc || im.src || ""; if (src && src.includes(imageUrl)) imageEls.push(im); } catch(e) {}
+          }
+        }
+        const contextEls = [...titleEls, ...imageEls];
+
+        function nearEachOther(node, ctxs, maxDepth=6) {
+          if (!node || !ctxs || ctxs.length===0) return false;
+          for (const ctx of ctxs) {
+            if (ctx.contains(node) || node.contains(ctx)) return true;
+            let a = node;
+            for (let i=0;i<maxDepth && a;i++) { if (a===ctx) return true; a = a.parentElement; }
+            a = ctx;
+            for (let i=0;i<maxDepth && a;i++) { if (a===node) return true; a = a.parentElement; }
+          }
+          return false;
+        }
+
+        for (const cand of candidates) {
+          if (!cand || cand.trim().length===0) continue;
+          // find nodes containing this candidate text
+          const nodes = Array.from(document.querySelectorAll("body *")).filter(n => {
+            try {
+              const t = (n.innerText || n.textContent || "");
+              return t && t.includes(cand);
+            } catch(e) { return false; }
+          });
+          info[cand].count = nodes.length;
+          if (contextEls.length===0) continue;
+          for (const n of nodes) {
+            if (nearEachOther(n, contextEls, 6)) { info[cand].near = true; break; }
+          }
+        }
+        return info;
+      }, uniqueRawList, title || "", image || "");
+
+      // aggregate proximity into our aggregated map and mark source 'selector-visible' if near
+      for (const [raw, obj] of aggregated.entries()) {
+        const prox = proximityInfo[raw];
+        if (prox) {
+          if (prox.near) obj.sources.add("selector-visible");
+          obj.prox = prox;
         }
       }
 
-      // PREÇOS HTML -------------------------------------
-      const htmlSelectors = [
-        "[itemprop='price']",
-        ".price",
-        ".product-price",
-        ".sales-price",
-        ".best-price",
-        ".valor",
-        ".priceFinal",
-        ".productPrice",
-        ".price--main",
-        ".product-price-amount",
-      ];
-
-      for (const sel of htmlSelectors) {
-        const txt = await page.$eval(sel, (el) => el.innerText || el.textContent || el.content).catch(
-          () => null
-        );
-        if (txt) rawPrices.push(txt);
-
-        const shadow = await querySelectorShadow(page, sel);
-        if (shadow?.text) rawPrices.push(shadow.text);
+      // convert aggregated into array for finalizePrice
+      const finalCandidates = [];
+      for (const [raw, obj] of aggregated.entries()) {
+        // push object with raw and combined sources (array) and count: used by finalizePrice
+        finalCandidates.push({ raw, source: Array.from(obj.sources).join("|"), count: obj.count });
       }
 
-      // PREÇOS XHR ----------------------------------------
-      const xhrPrices = collectXHR();
-      rawPrices.push(...xhrPrices);
+      // Also include raw xhr entries that might not be in aggregated (rare)
+      // (collectXHR earlier already pushed into rawCandidates so aggregated covered them)
 
-      // FALLBACK TEXTO ------------------------------------
-      if (rawPrices.length === 0) {
-        const text = await page.evaluate(() => document.body.innerText);
-        const m = text.match(/R\$\s?[\d\.,]+/g);
-        if (m) rawPrices.push(...m);
-      }
+      // FINALIZE
+      const finalPrice = finalizePrice(finalCandidates.map(fc => {
+        // convert back to object style expected: { raw, source } with source as each individual source tag
+        // split the joined source string to multiple sources
+        const sources = (fc.source || "").split("|").filter(Boolean);
+        // if no sources fallback to unknown
+        if (sources.length === 0) return { raw: fc.raw, source: "unknown" };
+        // push one entry per source to let finalizePrice aggregate
+        // but finalizePrice already aggregates by raw; here we'll just return the object with joined source as string - finalizePrice understands Set
+        return { raw: fc.raw, source: sources[0] || "unknown" };
+      }), (() => {
+        // build proximityMap keyed by raw original strings
+        const proxMap = {};
+        for (const [raw, obj] of aggregated.entries()) {
+          proxMap[raw] = { near: !!(obj.prox && obj.prox.near), count: (obj.prox && obj.prox.count) || obj.count || 0 };
+        }
+        return proxMap;
+      })());
 
-      console.log("RAW PRICES COLETADOS:", rawPrices.slice(0, 80));
-
-      // ====== NOVO: análise de proximidade no DOM para cada candidato ======
-      const uniqueCandidates = Array.from(new Set(rawPrices.map((r) => (r == null ? "" : String(r).trim()))));
-
-      const proximityInfo = await page.evaluate(
-        (candidates, titleText, imageUrl) => {
-          const info = {};
-          candidates.forEach((c) => {
-            info[c] = { near: false, count: 0 };
-          });
-
-          const titleEls = [];
-          if (titleText && titleText.trim().length > 0) {
-            const possible = Array.from(document.querySelectorAll("h1, .product-title, .product-name, .pdp-title"));
-            for (const el of possible) {
-              try {
-                if ((el.innerText || el.textContent || "").trim().includes(titleText.trim())) titleEls.push(el);
-              } catch (e) {}
-            }
-          }
-
-          const imageEls = [];
-          if (imageUrl && imageUrl.trim().length > 0) {
-            const imgs = Array.from(document.querySelectorAll("img"));
-            for (const im of imgs) {
-              try {
-                const src = im.currentSrc || im.src || "";
-                if (src && src.includes(imageUrl)) imageEls.push(im);
-              } catch (e) {}
-            }
-          }
-
-          const contextEls = [...titleEls, ...imageEls];
-
-          function nearEachOther(node, ctxs, maxDepth = 6) {
-            if (!node || !ctxs || ctxs.length === 0) return false;
-            for (const ctx of ctxs) {
-              if (ctx.contains(node) || node.contains(ctx)) return true;
-              let a = node;
-              for (let i = 0; i < maxDepth && a; i++) {
-                if (a === ctx) return true;
-                a = a.parentElement;
-              }
-              a = ctx;
-              for (let i = 0; i < maxDepth && a; i++) {
-                if (a === node) return true;
-                a = a.parentElement;
-              }
-            }
-            return false;
-          }
-
-          for (const cand of candidates) {
-            if (!cand || cand.trim().length === 0) continue;
-            const nodes = Array.from(document.querySelectorAll("body *")).filter((n) => {
-              try {
-                const t = (n.innerText || n.textContent || "");
-                return t && t.includes(cand);
-              } catch (e) { return false; }
-            });
-            info[cand].count = nodes.length;
-            if (contextEls.length === 0) continue;
-            for (const n of nodes) {
-              if (nearEachOther(n, contextEls, 6)) {
-                info[cand].near = true;
-                break;
-              }
-            }
-          }
-
-          return info;
-        },
-        uniqueCandidates,
-        title || "",
-        image || ""
-      );
-
-      // FINALIZAÇÃO UNIVERSAL (com proximityInfo)
-      const finalPrice = finalizePrice(rawPrices, proximityInfo);
-
-      if (title && typeof title === "string")
-        title = title.split("|")[0].split("-")[0].trim();
+      if (title && typeof title === "string") title = title.split("|")[0].split("-")[0].trim();
 
       await browser.close();
 
@@ -596,30 +575,31 @@ async function scrapeProduct(rawUrl) {
         title: title || null,
         price: finalPrice || null,
         image: image || null,
+        rawCandidatesCount: finalCandidates.length
       };
     } catch (err) {
-      await browser.close().catch(() => {});
-      return { success: false, error: err.message };
+      await browser.close().catch(()=>{});
+      console.error("SCRAPE ERROR:", err && err.message ? err.message : err);
+      return { success: false, error: String(err) };
     }
   });
 }
 
-// -------------------------------------------------------------
+// ---------------- routes ----------------
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
 app.post("/scrape", async (req, res) => {
   try {
     const url = req.body?.url || req.query?.url;
     if (!url) return res.status(400).json({ success: false, error: "URL ausente" });
-
     const result = await scrapeProduct(url);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    console.error("ROUTE ERROR:", e && e.message ? e.message : e);
+    res.status(500).json({ success: false, error: e.message || String(e) });
   }
 });
 
-// -------------------------------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
 
