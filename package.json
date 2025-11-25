@@ -14,7 +14,7 @@
     "p-queue": "^7.4.1",
     "dotenv": "^16.4.5",
     "jsdom": "^24.0.0",
-    "puppeteer": "^22.0.0",
+    "puppeteer": "19.11.1",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.1"
   }
