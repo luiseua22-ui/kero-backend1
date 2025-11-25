@@ -161,23 +161,98 @@ function normalizePrice(raw) {
 }
 
 // -------------------------------------------------------------
-// 🔥 UNIVERSAL PRICE FIXER — AGORA COM FILTRO DE PREÇOS IRREAIS
+// 🔥 REIMPLEMENTAÇÃO ROBUSTA do finalizePrice
+// usa scoring: prefira JSON-LD / meta / seletores principais / XHR / formato consistente / frequência
 function finalizePrice(allValues) {
   if (!Array.isArray(allValues) || allValues.length === 0) return null;
 
-  const nums = allValues
-    .map((p) => normalizePrice(p))
-    .filter((n) => typeof n === "number" && n > 0);
+  // normalize and keep original raw strings for scoring
+  const candidates = allValues
+    .map((raw) => {
+      const rawStr = raw == null ? "" : String(raw).trim();
+      const num = normalizePrice(rawStr);
+      return { raw: rawStr, num };
+    })
+    .filter((c) => c.num !== null);
 
-  if (nums.length === 0) return null;
+  if (candidates.length === 0) return null;
 
-  // 🔥 FILTRANDO PREÇOS IRREAIS (RESOLVE Riachuelo E QUALQUER OUTRO SITE)
-  const realistic = nums.filter((n) => n >= 1 && n <= 20000);
+  // frequency map based on normalized numeric value (stringified)
+  const freq = {};
+  for (const c of candidates) {
+    const key = c.num.toFixed(2);
+    freq[key] = (freq[key] || 0) + 1;
+  }
 
-  const finalList = realistic.length > 0 ? realistic : nums;
+  // scoring function
+  const scoreFor = (cand) => {
+    let score = 0;
+    const raw = cand.raw.toLowerCase();
 
-  const final = Math.min(...finalList);
+    // 1) Source hints in the raw string
+    // If raw contains explicit currency or BRL mention -> strong signal
+    if (/\br\$/.test(raw) || /\bbrl\b/.test(raw)) score += 6;
 
+    // If raw looks like meta amount (pure number) less weight
+    if (/^[\d\.,]+$/.test(raw)) score += 1;
+
+    // If raw contains words like 'de', 'por', 'à vista', 'à vista' maybe indicates final/discount
+    if (/\b(vista|de|por|agora|oferta|desconto|promo|preço)\b/.test(raw)) score += 2;
+
+    // 2) Format quality: BR format with thousands and cents (e.g., 1.234,56)
+    if (/^\d{1,3}(?:\.\d{3})*,\d{2}$/.test(cand.raw)) score += 5;
+
+    // 3) Decimal presence (has cents) is a good sign
+    if (/[,\.]\d{2}$/.test(cand.raw)) score += 3;
+
+    // 4) If raw contains "installment" or "parcela" penalize slightly (often not total)
+    if (/parcela|parcelas|installment|juros/.test(raw)) score -= 3;
+
+    // 5) Very small numbers (<2) are suspect but may be valid; penalize lightly
+    if (cand.num < 2) score -= 2;
+
+    // 6) Very large numbers are suspect; penalize (but not absolute block)
+    if (cand.num > 100000) score -= 6;
+    else if (cand.num > 20000) score -= 3;
+
+    // 7) Frequency boost: values that appear multiple times (from different sources) are more reliable
+    const f = freq[cand.num.toFixed(2)] || 0;
+    score += Math.min(f, 5) * 2; // up to +10
+
+    // 8) If raw contains many digits without separators (likely ID) penalize
+    if (/^\d{5,}$/.test(cand.raw.replace(/[^\d]/g, "")) && !/[.,]/.test(cand.raw)) score -= 5;
+
+    return score;
+  };
+
+  // compute scores
+  const scored = candidates.map((c) => ({ ...c, score: scoreFor(c) }));
+
+  // sort by score desc, tie-breaker by occurrence frequency then by closeness to median
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    const fa = freq[a.num.toFixed(2)] || 0;
+    const fb = freq[b.num.toFixed(2)] || 0;
+    if (fb !== fa) return fb - fa;
+    return a.num - b.num; // prefer lower price if everything else equal
+  });
+
+  // top candidate(s)
+  const topScore = scored[0].score;
+  const topCandidates = scored.filter((s) => s.score === topScore);
+
+  // if multiple top candidates, pick the one with the most occurrences, then the smallest numeric (to match "best price")
+  topCandidates.sort((a, b) => {
+    const fa = freq[a.num.toFixed(2)] || 0;
+    const fb = freq[b.num.toFixed(2)] || 0;
+    if (fb !== fa) return fb - fa;
+    return a.num - b.num;
+  });
+
+  const chosen = topCandidates[0];
+
+  // final formatting to BR currency
+  const final = chosen.num;
   return `R$ ${final.toFixed(2).replace(".", ",")}`;
 }
 
@@ -212,6 +287,7 @@ async function scrapeProduct(rawUrl) {
 
       const collectXHR = createXHRPriceCollector(page);
 
+      // NAVIGATION --------------------------------------------------------------------
       try {
         await page.goto(cleaned, { waitUntil: "networkidle2", timeout: 60000 });
       } catch {
@@ -222,10 +298,12 @@ async function scrapeProduct(rawUrl) {
       await autoScroll(page);
       await page.waitForTimeout(600);
 
+      // SCRAPING ----------------------------------------------------------------------
       let title = null;
       let image = null;
       let rawPrices = [];
 
+      // JSON-LD
       try {
         const blocks = await page.$$eval(
           'script[type="application/ld+json"]',
@@ -256,12 +334,14 @@ async function scrapeProduct(rawUrl) {
         }
       } catch {}
 
+      // OG ---------------------------------------------
       if (!title)
         title = await page.$eval(`meta[property="og:title"]`, (e) => e.content).catch(() => null);
 
       if (!image)
         image = await page.$eval(`meta[property="og:image"]`, (e) => e.content).catch(() => null);
 
+      // TÍTULO e IMAGEM fallback ------------------------
       if (!title) {
         title = await page.evaluate(() => {
           const sels = ["h1", ".product-title", ".product-name", ".pdp-title"];
@@ -291,6 +371,7 @@ async function scrapeProduct(rawUrl) {
         }
       }
 
+      // PREÇOS HTML -------------------------------------
       const htmlSelectors = [
         "[itemprop='price']",
         ".price",
@@ -314,15 +395,18 @@ async function scrapeProduct(rawUrl) {
         if (shadow?.text) rawPrices.push(shadow.text);
       }
 
+      // PREÇOS XHR ----------------------------------------
       const xhrPrices = collectXHR();
       rawPrices.push(...xhrPrices);
 
+      // FALLBACK TEXTO ------------------------------------
       if (rawPrices.length === 0) {
         const text = await page.evaluate(() => document.body.innerText);
         const m = text.match(/R\$\s?[\d\.,]+/g);
         if (m) rawPrices.push(...m);
       }
 
+      // FINALIZAÇÃO UNIVERSAL ------------------------------
       const finalPrice = finalizePrice(rawPrices);
 
       if (title && typeof title === "string")
