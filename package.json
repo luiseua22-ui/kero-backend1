@@ -1,7 +1,7 @@
 {
   "name": "kero-backend",
   "version": "1.0.0",
-  "description": "Backend do KERO com Playwright + Express",
+  "description": "Backend do KERO com Puppeteer Extra + Express",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -10,10 +10,13 @@
   "dependencies": {
     "express": "^4.19.2",
     "cors": "^2.8.5",
-    "playwright": "1.47.0",
-    "express-rate-limit": "^7.4.0",
     "p-queue": "^7.4.1",
     "dotenv": "^16.4.5",
-    "jsdom": "^24.0.0"
+    "jsdom": "^24.0.0",
+
+    "puppeteer": "^22.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.1"
   }
 }
+
