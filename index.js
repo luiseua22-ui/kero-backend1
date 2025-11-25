@@ -19,20 +19,15 @@ const queue = new PQueue({ concurrency: Number(process.env.SCRAPE_CONCURRENCY) |
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ------------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------------
+// ---------------- helpers ----------------
+
 function sanitizeIncomingUrl(raw) {
   if (!raw || typeof raw !== "string") return null;
   let s = raw.trim();
   const matches = [...s.matchAll(/https?:\/\/[^\s"']+/gi)].map((m) => m[0]);
   if (matches.length > 0) return matches[0];
   if (!/^https?:\/\//i.test(s)) s = "https://" + s;
-  try {
-    return new URL(s).toString();
-  } catch (e) {
-    return null;
-  }
+  try { return new URL(s).toString(); } catch (e) { return null; }
 }
 
 async function autoScroll(page, maxScroll = 2400) {
@@ -78,13 +73,9 @@ async function querySelectorShadow(page, selector) {
   }, selector);
 }
 
-// ------------------------------------------------------------------
-// Coleta XHR de preços com marcação de fonte e detecção de parcelas
-// Retorna lista de candidatos: { raw, source, isInstallment?, parcCount?, parcValue? }
-// ------------------------------------------------------------------
+// ---------------- XHR collector ----------------
 function createXHRPriceCollector(page) {
   const prices = [];
-
   page.on("response", async (resp) => {
     try {
       const url = resp.url().toLowerCase();
@@ -114,14 +105,12 @@ function createXHRPriceCollector(page) {
             ) {
               if (typeof v === "string" || typeof v === "number") {
                 const text = String(v).trim();
-                // Detecta parcela no texto (ex: "12 x 609.33" ou "12x de R$ 609,33")
-                const parc = text.match(/(\d+)\s*x\s*R?\$?\s*([\d\.,]+)/i) || text.match(/(\d+)\s*x\s*([\d\.,]+)/i);
+                // detect parcel pattern and store structured info if found
+                const parc = text.match(/(\d+)\s*[xX]\s*(?:de\s*)?R?\$?\s*([\d\.,]+)/i) || text.match(/(\d+)\s*[xX]\s*(?:de\s*)?([\d\.,]+)/i);
                 if (parc) {
-                  const parcCount = Number(parc[1]);
-                  const parcRaw = parc[2];
-                  prices.push({ raw: text, source: "xhr", isInstallment: true, parcCount, parcValueRaw: parcRaw });
-                  // também empilha o total computado como candidato (importante)
-                  prices.push({ raw: String(parcCount) + "x_total", source: "xhr", isInstallmentComputed: true, computedTotalRaw: `${parcCount}x${parcRaw}` });
+                  prices.push({ raw: text, source: "xhr", isInstallment: true, parcelCount: Number(parc[1]), parcelValueRaw: parc[2] });
+                  // add computed total candidate too
+                  prices.push({ raw: `${parc[1]}x_total_${parc[2]}`, source: "xhr", isInstallmentComputed: true, computedFrom: { count: Number(parc[1]), rawValue: parc[2] } });
                 } else {
                   prices.push({ raw: text, source: "xhr" });
                 }
@@ -133,86 +122,54 @@ function createXHRPriceCollector(page) {
 
         walk(json);
       }
-    } catch (e) {
-      // ignore noisy errors
-    }
+    } catch (e) {}
   });
-
   return () => prices;
 }
 
-// ------------------------------------------------------------------
-// Extrai número de string bruta e lida com centavos/milhares
-// Retorna { num: Number | null, note: string }
-// ------------------------------------------------------------------
+// ---------------- parsing number ----------------
 function parseNumberFromString(raw) {
   if (raw === null || raw === undefined) return { num: null, note: "empty" };
   let s = String(raw).trim();
-
-  // remove NBSP
   s = s.replace(/\u00A0/g, "");
-
-  // remove currency sign and letters
+  // keep only digits, dots and commas and 'x' for special markers
+  // remove currency letters
   s = s.replace(/R\$|BRL|\$/gi, "");
-  // remove non-digit,non-dot,non-comma,keep x marker for computedTotalRaw
-  s = s.replace(/[^\d\.,]/g, "");
-
+  // remove everything except digits, dot, comma
+  s = s.replace(/[^0-9\.,]/g, "");
   if (!s) return { num: null, note: "no digits" };
 
-  // Common formats:
-  // 1) 7.312,00 -> '.' thousands, ',' decimal
-  // 2) 7312.00 -> '.' decimal
-  // 3) 731200  -> maybe cents (when no separators)
-  // 4) 12.345.678 -> thousands only
-  // Strategy:
-  // - If contains both '.' and ',' assume '.' thousands, ',' decimal => remove dots, replace ',' with '.'
-  // - Else if contains ',' only and right side length <=2 then treat ',' as decimal => replace ',' with '.'
-  // - Else if contains '.' only and right side length ==2 treat '.' as decimal
-  // - Else if only digits and length > 5 treat as cents => divide by 100
   try {
     if (s.includes(".") && s.includes(",")) {
-      // thousands dots, decimal comma
+      // format 1.234,56
       s = s.replace(/\./g, "").replace(",", ".");
     } else if (s.includes(",") && !s.includes(".")) {
       const parts = s.split(",");
-      if (parts[1] && parts[1].length <= 2) {
-        s = s.replace(",", ".");
-      } else {
-        // ambiguous, remove commas (they might be thousands)
-        s = s.replace(/,/g, "");
-      }
+      if (parts[1] && parts[1].length <= 2) s = s.replace(",", ".");
+      else s = s.replace(/,/g, "");
     } else if (s.includes(".") && !s.includes(",")) {
       const parts = s.split(".");
-      if (parts[1] && parts[1].length === 2) {
-        // dot as decimal
-        // leave as is
-      } else {
-        // probably thousands separators -> remove them
-        s = s.replace(/\./g, "");
-      }
+      if (!(parts[1] && parts[1].length === 2)) s = s.replace(/\./g, "");
     }
 
-    // final cleanup
     s = s.replace(/[^0-9.]/g, "");
     if (!s) return { num: null, note: "cleaned empty" };
-
     const n = Number(s);
-    if (Number.isFinite(n)) {
-      if (n > 100000 && /^(\d{6,})$/.test(s.replace(".", ""))) {
-        // example '731200' probably cents -> 7312.00? we attempt cent heuristic
-        return { num: n / 100, note: "cent heuristic" };
-      }
-      return { num: n, note: "parsed" };
+    if (!Number.isFinite(n)) return { num: null, note: "not finite" };
+
+    // if too large with no separators interpret as cents (heuristic)
+    const digitsOnly = s.replace(".", "");
+    if (/^\d+$/.test(digitsOnly) && digitsOnly.length >= 6 && n > 100000) {
+      // e.g., 731200 -> 7312.00
+      return { num: n / 100, note: "cent heuristic" };
     }
-    return { num: null, note: "not finite" };
+    return { num: n, note: "parsed" };
   } catch (e) {
     return { num: null, note: "error" };
   }
 }
 
-// ------------------------------------------------------------------
-// Detecta se uma string representa parcela (ex: "12 x R$ 609,33" ou "12x de 609,33")
-// ------------------------------------------------------------------
+// ---------------- installment detect ----------------
 function detectInstallment(raw) {
   if (!raw) return null;
   const s = String(raw);
@@ -221,140 +178,151 @@ function detectInstallment(raw) {
   const count = Number(m[1]);
   const valueRaw = m[2];
   const parsed = parseNumberFromString(valueRaw);
-  if (parsed.num && count > 0) {
-    return { count, value: parsed.num, total: parsed.num * count };
-  }
+  if (parsed.num && count > 0) return { count, value: parsed.num, total: parsed.num * count };
   return null;
 }
 
-// ------------------------------------------------------------------
-// Escolhe o melhor preço entre candidatos complexos
-// Cada candidato: { raw, source, isInstallment?, isInstallmentComputed?, parcCount?, parcValueRaw?, computedTotalRaw? }
-// ------------------------------------------------------------------
+// ---------------- isInstallment quick check ----------------
+function isInstallmentString(raw) {
+  if (!raw) return false;
+  const s = String(raw).toLowerCase();
+  return /(\d+)\s*x|parcel|parcela|vezes/i.test(s);
+}
+
+// ---------------- final selection (robust) ----------------
 function finalizePrice(candidates, proximityMap = {}) {
-  // Normalize candidate objects into scored entries
+  // candidates: array of { raw, source, ...maybe isInstallment or isInstallmentComputed... }
   const entries = [];
 
   for (const c of candidates) {
+    if (!c || !c.raw) continue;
     try {
-      // if it's an xhr computed total marker like "12x_total" with computedTotalRaw present, handle below
-      if (c.isInstallmentComputed && c.computedTotalRaw) {
-        // computedTotalRaw example: "12x609,33" -> extract and compute
-        const inst = detectInstallment(c.computedTotalRaw);
-        if (inst && inst.total) {
-          entries.push({ raw: c.computedTotalRaw, num: inst.total, source: c.source, computedTotal: true });
+      // computed installment marker
+      if (c.isInstallmentComputed && c.computedFrom) {
+        const parsed = parseNumberFromString(c.computedFrom.rawValue);
+        if (parsed.num) {
+          const total = parsed.num * Number(c.computedFrom.count);
+          entries.push({ raw: c.raw, num: total, source: c.source || "xhr", computedTotal: true });
         }
         continue;
       }
 
-      // direct installment info from xhr: isInstallment true with parcCount and parcValueRaw
-      if (c.isInstallment && c.parcCount && c.parcValueRaw) {
-        const parcParsed = parseNumberFromString(c.parcValueRaw);
-        if (parcParsed.num) {
-          const total = parcParsed.num * Number(c.parcCount);
-          // push both: the raw parcel (low weight) and the computed total (higher weight)
-          entries.push({ raw: c.raw, num: parcParsed.num, source: c.source, isParcel: true, parcelCount: c.parcCount });
-          entries.push({ raw: `${c.parcCount}x_total_${c.parcValueRaw}`, num: total, source: c.source, computedTotal: true });
+      // structured installment from XHR
+      if (c.isInstallment && c.parcelCount && c.parcelValueRaw) {
+        const pv = parseNumberFromString(c.parcelValueRaw);
+        if (pv.num) {
+          const total = pv.num * Number(c.parcelCount);
+          entries.push({ raw: c.raw + "_parcel_value", num: pv.num, source: c.source || "xhr", isParcel: true, parcelCount: c.parcelCount });
+          entries.push({ raw: c.raw + "_parcel_total", num: total, source: c.source || "xhr", computedTotal: true });
         }
         continue;
       }
 
-      // otherwise try detect installment in raw string
+      // try detect installment inside raw
       const inst = detectInstallment(c.raw);
       if (inst && inst.total) {
-        // push computed total candidate (high priority), and keep parcel as low-priority
-        entries.push({ raw: c.raw + "_parcel", num: inst.value, source: c.source, isParcel: true, parcelCount: inst.count });
-        entries.push({ raw: c.raw + "_total", num: inst.total, source: c.source, computedTotal: true });
+        entries.push({ raw: c.raw + "_inst_parcel", num: inst.value, source: c.source || "mixed", isParcel: true, parcelCount: inst.count });
+        entries.push({ raw: c.raw + "_inst_total", num: inst.total, source: c.source || "mixed", computedTotal: true });
         continue;
       }
 
       // normal parse
       const parsed = parseNumberFromString(c.raw);
-      if (parsed.num) {
-        entries.push({ raw: c.raw, num: parsed.num, source: c.source, note: parsed.note });
-      }
+      if (parsed.num) entries.push({ raw: c.raw, num: parsed.num, source: c.source || "unknown", note: parsed.note });
     } catch (e) {
-      // ignore candidate
+      // ignore
     }
   }
 
-  // Filter numeric, positive
-  const numeric = entries.filter((e) => typeof e.num === "number" && isFinite(e.num) && e.num > 0);
-
+  const numeric = entries.filter(e => typeof e.num === "number" && Number.isFinite(e.num) && e.num > 0);
   if (numeric.length === 0) {
-    console.log("Nenhum candidato válido:", candidates);
+    console.log("No numeric candidates:", candidates);
     return null;
   }
 
-  // Frequency map by value (to favor repeated values)
+  // build frequency map
   const freq = {};
-  numeric.forEach((e) => {
-    const key = Number(e.num).toFixed(2);
-    freq[key] = (freq[key] || 0) + 1;
-  });
+  numeric.forEach(e => { const k = Number(e.num).toFixed(2); freq[k] = (freq[k] || 0) + 1; });
 
-  // Score each candidate with heuristics:
-  // - computedTotal gets big boost
-  // - source jsonld / selector visible get boosts
-  // - freq increases score
-  // - parcel raw values penalized
-  // - proximity info (if provided) adds score
-  const scored = numeric.map((e) => {
+  // compute median for coherence checks
+  const uniqueNums = Array.from(new Set(numeric.map(e => e.num))).sort((a,b)=>a-b);
+  const median = uniqueNums.length ? uniqueNums[Math.floor(uniqueNums.length/2)] : null;
+  const maxValue = Math.max(...numeric.map(n => n.num));
+
+  // scoring
+  const scored = numeric.map(e => {
     let score = 0;
-    // source weighting
-    if (e.source && e.source.includes("jsonld")) score += 40;
-    if (e.source && e.source.includes("selector")) score += 20;
-    if (e.source && e.source.includes("xhr")) score += 10;
-    if (e.source && e.source.includes("body")) score += 2;
+    // source priority
+    if (String(e.source).includes("jsonld")) score += 40;
+    if (String(e.source).includes("selector")) score += 25;
+    if (String(e.source).includes("xhr")) score += 10;
+    if (String(e.source).includes("body")) score += 2;
 
-    // computed totals get strong boost
-    if (e.computedTotal) score += 45;
+    // computedTotal high boost
+    if (e.computedTotal) score += 50;
 
     // parcel raw penalize
-    if (e.isParcel) score -= 15;
+    if (e.isParcel) score -= 20;
 
-    // frequency
+    // occurrences
     const f = freq[Number(e.num).toFixed(2)] || 0;
-    score += Math.min(f, 5) * 5;
+    score += Math.min(f, 5) * 6;
 
-    // proximity: if the exact raw string has info in proximityMap (near product title/image), boost
+    // proximity boost
     const prox = proximityMap[e.raw] || proximityMap[String(e.raw)] || null;
     if (prox) {
-      if (prox.near) score += 18;
-      score += Math.min(prox.count || 0, 5) * 2;
+      if (prox.near) score += 20;
+      score += Math.min(prox.count||0,5) * 2;
     }
 
-    // coherence heuristic: avoid absurds relative to median
-    // compute median of unique nums
+    // prefer bigger numbers generally (price totals)
+    // but avoid absurdly large ones: if number >> median*50 penalize
+    if (median && median > 0) {
+      const ratio = e.num / median;
+      if (ratio >= 0.2 && ratio <= 10) score += 3;
+      if (ratio < 0.02) score -= 10;
+      if (ratio > 50) score -= 30;
+    }
+
+    // penalize tiny numbers < 1 real (unless all candidates < 5)
+    if (e.num < 1) score -= 25;
+
+    // small-value safety: if all nums < 5 allow them by not penalizing further (handled below)
     return { ...e, score };
   });
 
-  // sort by score desc, tie-breaker by numeric value closeness to max (prefer higher real price)
-  scored.sort((a, b) => {
+  // if all numeric candidates are small (<5), remove small penalty for <1
+  const allSmall = uniqueNums.every(n => n < 5);
+  if (allSmall) {
+    for (const s of scored) {
+      if (s.num < 1) s.score += 30;
+    }
+  }
+
+  scored.sort((a,b) => {
     if (b.score !== a.score) return b.score - a.score;
-    return b.num - a.num;
+    // tie-breaker: prefer closer to maxValue (prefer totals)
+    const da = Math.abs(b.num - maxValue), db = Math.abs(a.num - maxValue);
+    return da - db;
   });
 
-  // log candidates for debugging
+  // debug output
   try {
-    console.log("CANDIDATOS (num,score,raw,source):", scored.map(s => ({ num: s.num, score: s.score, raw: s.raw, source: s.source })));
+    console.log("PRICE CANDIDATES (num,score,raw,source):", scored.map(s => ({ num: s.num, score: s.score, raw: s.raw, source: s.source })));
   } catch (e) {}
 
   const best = scored[0];
   if (!best) return null;
-
   return `R$ ${Number(best.num).toFixed(2).replace(".", ",")}`;
 }
 
-// ------------------------------------------------------------------
-// Scraper principal
-// ------------------------------------------------------------------
+
+// ---------------- main scraper ----------------
 async function scrapeProduct(rawUrl) {
   return queue.add(async () => {
     const cleaned = sanitizeIncomingUrl(rawUrl);
     console.log("URL RECEBIDA:", rawUrl);
     console.log("URL SANITIZADA:", cleaned);
-
     if (!cleaned) return { success: false, error: "URL inválida" };
 
     const browser = await puppeteer.launch({
@@ -379,7 +347,7 @@ async function scrapeProduct(rawUrl) {
       try {
         await page.goto(cleaned, { waitUntil: "networkidle2", timeout: 60000 });
       } catch (err) {
-        console.warn("networkidle2 falhou, tentando domcontentloaded:", err.message || err);
+        console.warn("networkidle2 falhou, tentando domcontentloaded:", err && (err.message || err));
         await page.goto(cleaned, { waitUntil: "domcontentloaded", timeout: 90000 });
       }
 
@@ -393,13 +361,14 @@ async function scrapeProduct(rawUrl) {
 
       // JSON-LD
       try {
-        const jsons = await page.$$eval('script[type="application/ld+json"]', nodes => nodes.map(n => n.textContent).filter(Boolean));
-        for (const block of jsons) {
-          let parsed;
-          try { parsed = JSON.parse(block); } catch { parsed = null; }
+        const blocks = await page.$$eval('script[type="application/ld+json"]', nodes => nodes.map(n => n.textContent).filter(Boolean));
+        for (const block of blocks) {
+          let parsed = null;
+          try { parsed = JSON.parse(block); } catch (e) { parsed = null; }
           if (!parsed) continue;
-          const arr = Array.isArray(parsed) ? parsed : [parsed];
-          for (const item of arr.flat()) {
+          const list = Array.isArray(parsed) ? parsed : [parsed];
+          for (const item of list.flat()) {
+            if (!item) continue;
             if (!title && (item.name || item.title)) title = item.name || item.title;
             if (!image && item.image) {
               const img = Array.isArray(item.image) ? item.image[0] : item.image;
@@ -408,29 +377,25 @@ async function scrapeProduct(rawUrl) {
             if (item.offers) {
               const offers = Array.isArray(item.offers) ? item.offers : [item.offers];
               for (const o of offers) {
-                if (o.price) {
-                  rawCandidates.push({ raw: String(o.price), source: "jsonld" });
-                }
-                // sometimes offers have priceSpecification or priceCurrency
+                if (o.price) rawCandidates.push({ raw: String(o.price), source: "jsonld" });
+                // sometimes priceSpecification contains subfields
                 if (o.priceSpecification && typeof o.priceSpecification === "object") {
-                  const priceSpec = o.priceSpecification.price || o.priceSpecification.priceComponent || o.priceSpecification.minPrice || o.priceSpecification.maxPrice;
-                  if (priceSpec) rawCandidates.push({ raw: String(priceSpec), source: "jsonld" });
+                  const spec = o.priceSpecification.price || o.priceSpecification.priceComponent || o.priceSpecification.minPrice || o.priceSpecification.maxPrice;
+                  if (spec) rawCandidates.push({ raw: String(spec), source: "jsonld" });
                 }
               }
             }
           }
         }
-      } catch (e) {
-        // ignore parse errors
-      }
+      } catch (e) { /* ignore */ }
 
-      // OpenGraph fallback
+      // og fallback
       const ogTitle = await page.$eval("meta[property='og:title']", e => e.content).catch(() => null);
       if (ogTitle && !title) title = ogTitle;
       const ogImage = await page.$eval("meta[property='og:image']", e => e.content).catch(() => null);
       if (ogImage && !image) image = ogImage;
 
-      // HTML selectors (visible)
+      // visible selectors
       const selList = ["[itemprop='price']", ".price", ".product-price", ".sales-price", ".valor", ".priceFinal", ".productPrice", ".price--main", ".product-price-amount"];
       for (const sel of selList) {
         const vals = await page.$$eval(sel, els => els.map(e => (e.getAttribute('content') || e.innerText || e.textContent || '').trim()).filter(Boolean)).catch(() => []);
@@ -440,37 +405,37 @@ async function scrapeProduct(rawUrl) {
         if (shadow && shadow.text) rawCandidates.push({ raw: shadow.text, source: "selector" });
       }
 
-      // XHR candidates
+      // xhr
       const xhrList = collectXHR();
       for (const o of xhrList) {
-        // o may be string or object: ensure object form
+        if (!o) continue;
         if (typeof o === "string") rawCandidates.push({ raw: o, source: "xhr" });
         else rawCandidates.push(o);
       }
 
-      // Body fallback: capture "R$ 1.234,56" patterns but mark source 'body'
+      // body fallback
       const body = await page.evaluate(() => document.body.innerText).catch(() => "");
       if (body) {
         const matches = Array.from(new Set((body.match(/(?:R\$|\b)\s?[\d\.,]{2,}/g) || []).map(s => s.trim())));
         for (const m of matches) rawCandidates.push({ raw: m, source: "body" });
       }
 
-      // remove empties and duplicates (keep source variety)
+      // dedupe preserving source variety
       const seen = new Set();
       const dedup = [];
       for (const c of rawCandidates) {
         if (!c || !c.raw) continue;
-        const key = `${String(c.raw).trim()}|${c.source || ""}`;
+        const key = `${String(c.raw).trim()}|${c.source||""}`;
         if (seen.has(key)) continue;
         seen.add(key);
         dedup.push(c);
       }
 
-      // Build proximity map (help scoring)
+      // proximity map
       const uniqueRaw = Array.from(new Set(dedup.map(c => String(c.raw))));
       const proximityInfo = await page.evaluate((cands, titleText, imageUrl) => {
         const info = {};
-        cands.forEach(c => (info[c] = { near: false, count: 0 }));
+        cands.forEach(c => info[c] = { near: false, count: 0 });
         const titleEls = titleText ? Array.from(document.querySelectorAll("h1, .product-title, .product-name")).filter(el => (el.innerText || el.textContent || "").includes(titleText)) : [];
         const imgEls = imageUrl ? Array.from(document.querySelectorAll("img")).filter(img => (img.src || img.currentSrc).includes(imageUrl)) : [];
         const ctxEls = [...titleEls, ...imgEls];
@@ -493,10 +458,11 @@ async function scrapeProduct(rawUrl) {
         return info;
       }, uniqueRaw, title || "", image || "");
 
-      // Final price selection
+      // finalize
       const finalPrice = finalizePrice(dedup, proximityInfo);
 
       if (title && typeof title === "string") title = title.split("|")[0].split("-")[0].trim();
+
       await browser.close();
 
       return {
@@ -508,22 +474,19 @@ async function scrapeProduct(rawUrl) {
         rawCandidatesCount: dedup.length
       };
     } catch (err) {
-      await browser.close().catch(() => {});
+      await browser.close().catch(()=>{});
       return { success: false, error: String(err) };
     }
   });
 }
 
-// ------------------------------------------------------------------
-// Routes
-// ------------------------------------------------------------------
+// ---------------- routes ----------------
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
 app.post("/scrape", async (req, res) => {
   try {
     const url = req.body?.url || req.query?.url;
     if (!url) return res.status(400).json({ success: false, error: "URL ausente" });
-
     const result = await scrapeProduct(url);
     res.json(result);
   } catch (e) {
@@ -531,7 +494,6 @@ app.post("/scrape", async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
 
