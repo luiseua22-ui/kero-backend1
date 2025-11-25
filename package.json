@@ -10,10 +10,10 @@
   "dependencies": {
     "express": "^4.19.2",
     "cors": "^2.8.5",
+    "express-rate-limit": "^7.4.0",
     "p-queue": "^7.4.1",
     "dotenv": "^16.4.5",
     "jsdom": "^24.0.0",
-
     "puppeteer": "^22.0.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.1"
