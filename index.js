@@ -115,7 +115,7 @@ function createXHRPriceCollector(page) {
   return () => prices;
 }
 
-// 🔥 NOVA FUNÇÃO DE NORMALIZAÇÃO DE PREÇO — SUPER PRECISA
+// 🔥 NOVA FUNÇÃO DE NORMALIZAÇÃO — PRECISA
 function normalizePrice(raw) {
   if (!raw) return null;
 
@@ -125,7 +125,7 @@ function normalizePrice(raw) {
     .replace(/[^0-9.,]/g, "")
     .trim();
 
-  // Remove pontos que são milhares
+  // Remove pontos usados como separador de milhar
   if (txt.includes(".")) {
     const parts = txt.split(".");
     if (parts.length > 2) {
@@ -236,7 +236,7 @@ async function scrapeProduct(rawUrl) {
         image = await page.$eval('meta[property="og:image"]', el => el.content).catch(() => null);
       }
 
-      // FallBack manual de título / imagem / preço
+      // Fallback manual
       try {
         if (!title) {
           const t = await page.evaluate(() => {
@@ -284,23 +284,39 @@ async function scrapeProduct(rawUrl) {
         }
       } catch (e) {}
 
-      // preços via XHR
+      // 🔥 NOVA LÓGICA XHR → NUNCA sobrescrever preço existente
       try {
         const collected = getCollectedPrices();
-        if ((!price || price.length < 3) && collected.length) {
-          const candidate = collected.find(c => c.value)?.value;
-          if (candidate) price = candidate;
+
+        if (!price && collected.length) {
+          const parsedCandidates = collected
+            .map(c => c.value)
+            .filter(v => v && v.length >= 2)
+            .map(v => ({
+              raw: v,
+              num: Number(
+                v.replace(/[^\d.,]/g, "")
+                 .replace(/\.(?=\d{3})/g, "")
+                 .replace(",", ".")
+              )
+            }))
+            .filter(v => !isNaN(v.num) && v.num > 0)
+            .sort((a, b) => b.num - a.num);
+
+          if (parsedCandidates.length) {
+            price = parsedCandidates[0].raw;
+          }
         }
       } catch (e) {}
 
-      // fallback via leitura do texto inteiro da página
+      // fallback final via texto da página
       if (!price) {
         const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
         const m = bodyText.match(/R\$\s?[\d\.,]+/);
         if (m) price = m[0];
       }
 
-      // LIMPEZA FINAL
+      // limpeza
       const formattedPrice = normalizePrice(price);
 
       if (title && typeof title === 'string')
