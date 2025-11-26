@@ -1,5 +1,5 @@
 // index.js - scraper completo com nova lógica de preço (prioriza JSON-LD, Selectors diretos e proximidade ao CTA)
-// Versão final: Ajuste de pontuação para priorizar preço padrão (Full Price) sobre desconto condicional (Pix/Boleto)
+// Versão final: Correção do bug de divisão por 100 (cent heuristic) para grandes valores.
 
 import express from "express";
 import cors from "cors";
@@ -175,9 +175,13 @@ function parseNumberFromString(raw) {
     let n = Number(t);
     if (!Number.isFinite(n)) return { num: null, note: "not finite" };
 
-    // heuristic: long integer without separators likely centavos -> apply conservatively
+    // CORREÇÃO CRÍTICA: Se o número resultante (t) já contém um ponto decimal,
+    // ele foi formatado corretamente (ex: 140235.30) e a heurística não deve ser aplicada.
     const digitsOnly = t.replace(".", "");
-    if (/^\d+$/.test(digitsOnly) && digitsOnly.length >= 7 && n > 10000) {
+    const hasDecimalPoint = t.includes('.');
+
+    // Heurística: long integer without separators likely centavos -> apply conservatively
+    if (!hasDecimalPoint && /^\d+$/.test(digitsOnly) && digitsOnly.length >= 7 && n > 10000) {
         return { num: n / 100, note: "cent heuristic" };
     }
 
@@ -211,20 +215,21 @@ async function findPricesNearCTA(page) {
         function collectNearbyTexts(el) {
             const texts = [];
             try {
-                if (!el) return texts;
-                if (el.innerText) texts.push(el.innerText);
-                if (el.parentElement) {
+                if (el && el.innerText) texts.push(el.innerText);
+                if (el && el.parentElement) {
                     for (const sib of Array.from(el.parentElement.children)) {
                         if (sib && sib !== el && sib.innerText) texts.push(sib.innerText);
                     }
                 }
                 let node = el.parentElement;
                 for (let i = 0; i < 4 && node; i++) {
-                    if (node.innerText) texts.push(node.innerText);
+                    if (node && node.innerText) texts.push(node.innerText);
                     node = node.parentElement;
                 }
-                for (const d of Array.from(el.querySelectorAll ? el.querySelectorAll("*") : [])) {
-                    if (d.innerText) texts.push(d.innerText);
+                if (el && el.querySelectorAll) {
+                    for (const d of Array.from(el.querySelectorAll("*"))) {
+                        if (d.innerText) texts.push(d.innerText);
+                    }
                 }
             } catch (e) { }
             return texts;
@@ -259,7 +264,7 @@ async function findPricesNearCTA(page) {
     });
 }
 
-// ---------------- FINAL PRICE SELECTION (CORRIGIDO: Score ajustado e removido tiebreaker de menor preço) ----------------
+// ---------------- FINAL PRICE SELECTION ----------------
 function selectBestPrice(candidatesWithMeta, proximityMap = {}, debug) {
     // debug is an object we push traces into
     if (!Array.isArray(candidatesWithMeta) || candidatesWithMeta.length === 0) {
@@ -378,22 +383,21 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}, debug) {
 
             // Pontuação baseada na fonte (Aumentada para as fontes mais confiáveis)
             if (src.includes("jsonld")) score += 80;
-            // CORREÇÃO 2: Aumentar o peso do Selector (agora +60)
-            else if (src.includes("selector")) score += 60; 
-            // CORREÇÃO 2: Diminuir o peso do NearCTA (agora +35)
-            else if (src.includes("nearCTA")) score += 35; 
+            // Aumentei o peso do Selector (agora +60)
+            else if (src.includes("selector")) score += 60;
+            // Diminuí o peso do NearCTA (agora +35)
+            else if (src.includes("nearCTA")) score += 35;
             else if (src.includes("xhr")) score += 20;
             else if (src.includes("body")) score += 5;
             else score += 5;
 
-            // CORREÇÃO 3: Redução do boost para Computed Totals (de 10 para 5)
-            if (p.computedTotal) score += 5; 
+            // Redução do boost para Computed Totals (apenas +5)
+            if (p.computedTotal) score += 5;
 
             // Penalidade para o valor da parcela isolada
             if (p.isParcel) score -= 50;
 
             // Penalizar "List Price" (Preço "De") e bonificar "Sale Price" (Preço "Por")
-            // Mantendo a penalidade para preços claramente 'antigos', mas removendo a penalidade ampla em 'list'
             if (field.includes("original") || field.includes("old") || field.includes("from")) {
                 score -= 30; // Penaliza preço antigo
             }
@@ -446,9 +450,6 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}, debug) {
         debug.reason = "no_best_candidate";
         return null;
     }
-
-    // CORREÇÃO 4: Removemos o tiebreaker que favorecia o menor preço,
-    // pois a lógica de pontuação refinada deve decidir.
 
     // safety: if best comes from cent heuristic but there's explicit R$ candidate, prefer explicit
     if (best && /cent heuristic/i.test(best.note || "") && processed.some(p => /R\$/i.test(p.raw))) {
