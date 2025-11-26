@@ -1,3 +1,4 @@
+// index.js — Scraper refeito: rapidez + precisão de preço
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -19,18 +20,18 @@ const queue = new PQueue({ concurrency: Number(process.env.SCRAPE_CONCURRENCY) |
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-/* ---------------- helpers ---------------- */
+/* ---------------- utils ---------------- */
 
 function sanitizeIncomingUrl(raw) {
   if (!raw || typeof raw !== "string") return null;
   let s = raw.trim();
-  const matches = [...s.matchAll(/https?:\/\/[^\s"']+/gi)].map((m) => m[0]);
+  const matches = [...s.matchAll(/https?:\/\/[^\s"']+/gi)].map(m => m[0]);
   if (matches.length > 0) return matches[0];
   if (!/^https?:\/\//i.test(s)) s = "https://" + s;
   try { return new URL(s).toString(); } catch (e) { return null; }
 }
 
-async function autoScroll(page, maxScroll = 2400) {
+async function autoScroll(page, maxScroll = 2000) {
   await page.evaluate(async (maxScroll) => {
     await new Promise((resolve) => {
       let total = 0;
@@ -42,54 +43,30 @@ async function autoScroll(page, maxScroll = 2400) {
           clearInterval(timer);
           resolve();
         }
-      }, 130);
+      }, 120);
     });
   }, maxScroll);
 }
 
-async function querySelectorShadow(page, selector) {
-  return page.evaluate((sel) => {
-    function search(root) {
-      try {
-        if (root.querySelector) {
-          const found = root.querySelector(sel);
-          if (found) return found;
-        }
-        const nodes = root.querySelectorAll ? Array.from(root.querySelectorAll("*")) : [];
-        for (const n of nodes) {
-          if (n.shadowRoot) {
-            const r = search(n.shadowRoot);
-            if (r) return r;
-          }
-        }
-      } catch (e) {}
-      return null;
-    }
-    const el = search(document);
-    if (!el) return null;
-    if (el.tagName === "IMG") return { type: "img", src: el.src || el.currentSrc || null };
-    if (el.tagName === "META") return { type: "meta", content: el.content || null };
-    return { type: "other", text: (el.innerText || el.textContent || "").trim() || null };
-  }, selector);
-}
-
 /* ---------------- XHR collector (improved) ----------------
-   - captura preços em JSON e marca parcelas / campos
+   coleta respostas JSON que contenham preços e marca a fonte
 */
 function createXHRPriceCollector(page) {
   const prices = [];
   page.on("response", async (resp) => {
     try {
       const url = resp.url().toLowerCase();
-      // heurística de endpoints
+      // heurística: endpoints com probabilidade de conter preço
       if (
         url.includes("price") ||
         url.includes("offer") ||
+        url.includes("offers") ||
         url.includes("sku") ||
         url.includes("product") ||
         url.includes("pricing") ||
         url.includes("/item") ||
-        url.includes("/products")
+        url.includes("/products") ||
+        url.includes("/cart")
       ) {
         const ctype = resp.headers()["content-type"] || "";
         if (!ctype.includes("application/json")) return;
@@ -102,21 +79,19 @@ function createXHRPriceCollector(page) {
             const v = o[k];
             if (v === null || v === undefined) continue;
 
-            // strings / numbers as candidates
+            // strings/numbers as candidates
             if (typeof v === "string" || typeof v === "number") {
               const text = String(v).trim();
-              // detect parcel pattern inside json value
-              const parcelMatch = text.match(/(\d+)\s*[xX]\s*(?:de\s*)?R?\$?\s*([\d\.,]+)/i) || text.match(/(\d+)\s*[xX]\s*(?:de\s*)?([\d\.,]+)/i);
+              // detecta padrão de parcelas (ex: "12 x R$ 609,33", "12x609,33")
+              const parcelMatch = text.match(/(\d{1,3})\s*[xX]\s*(?:de\s*)?R?\$?\s*([\d\.,]+)/i) || text.match(/(\d{1,3})x([\d\.,]+)/i);
               if (parcelMatch) {
                 prices.push({ raw: text, source: "xhr", isInstallment: true, parcelCount: Number(parcelMatch[1]), parcelValueRaw: parcelMatch[2], url });
-                // also push a marker for computed total (we'll compute later)
                 prices.push({ raw: `computed_installment_total:${parcelMatch[1]}x${parcelMatch[2]}`, source: "xhr", computedFrom: { count: Number(parcelMatch[1]), rawValue: parcelMatch[2] }, url });
               } else {
                 prices.push({ raw: text, source: "xhr", url });
               }
             }
 
-            // common price-like object: price, amount, value
             if (typeof v === "object") walk(v);
           }
         };
@@ -130,34 +105,24 @@ function createXHRPriceCollector(page) {
   return () => prices;
 }
 
-/* ---------------- parse helpers ----------------
-   convert string -> number (BR/EN heuristics),
-   detect installments,
-   handle numeric-only centavos heuristics
-*/
+/* ---------------- parsing helpers ---------------- */
+
 function parseNumberFromString(raw) {
   if (raw === null || raw === undefined) return { num: null, note: "empty" };
   let s = String(raw).trim();
   if (!s) return { num: null, note: "empty" };
 
-  // remove NBSPs
-  s = s.replace(/\u00A0/g, "");
+  s = s.replace(/\u00A0/g, ""); // NBSP
+  s = s.replace(/(R\$|BRL|\$)/gi, "");
 
-  // remove currency letters but keep separators
-  s = s.replace(/R\$|BRL|\$/gi, "");
-
-  // if contains 'x' and digits, leave for installment detection upstream
-  // now remove non-digit/sep
   const cleaned = s.replace(/[^0-9\.,]/g, "");
   if (!cleaned) return { num: null, note: "no digits" };
-
   let t = cleaned;
 
-  // If both '.' and ',' present, assume Brazilian style 1.234,56
   if (t.includes(".") && t.includes(",")) {
+    // 1.234,56 => 1234.56
     t = t.replace(/\./g, "").replace(",", ".");
   } else if (t.includes(",") && !t.includes(".")) {
-    // ambiguous: treat comma as decimal if right side length <=2
     const parts = t.split(",");
     if (parts[1] && parts[1].length <= 2) {
       t = t.replace(",", ".");
@@ -165,24 +130,21 @@ function parseNumberFromString(raw) {
       t = t.replace(/,/g, "");
     }
   } else if (t.includes(".") && !t.includes(",")) {
-    // if dot used, but the right side length != 2, treat dots as thousands
     const parts = t.split(".");
     if (!(parts[1] && parts[1].length === 2)) {
       t = t.replace(/\./g, "");
     }
   }
 
-  // remove any leftover non-digit/dot
   t = t.replace(/[^0-9.]/g, "");
   if (!t) return { num: null, note: "cleaned empty" };
 
   let n = Number(t);
   if (!Number.isFinite(n)) return { num: null, note: "not finite" };
 
-  // Heuristic: if extremely big integer without decimal separators, maybe centavos: e.g., "731200" likely 7312.00
+  // heurística centavos: "731200" -> 7312.00
   const digitsOnly = t.replace(".", "");
   if (/^\d+$/.test(digitsOnly) && digitsOnly.length >= 6 && n > 100000) {
-    // interpret as cents
     return { num: n / 100, note: "cent heuristic" };
   }
 
@@ -192,7 +154,7 @@ function parseNumberFromString(raw) {
 function detectInstallmentFromString(raw) {
   if (!raw) return null;
   const s = String(raw);
-  const m = s.match(/(\d{1,3})\s*[xX]\s*(?:de\s*)?R?\$?\s*([\d\.,]+)/i) || s.match(/(\d{1,3})\s*[xX]\s*(?:de\s*)?([\d\.,]+)/i);
+  const m = s.match(/(\d{1,3})\s*[xX]\s*(?:de\s*)?R?\$?\s*([\d\.,]+)/i) || s.match(/(\d{1,3})x([\d\.,]+)/i);
   if (!m) return null;
   const count = Number(m[1]);
   const valueRaw = m[2];
@@ -201,52 +163,48 @@ function detectInstallmentFromString(raw) {
   return null;
 }
 
-/* ---------------- final price decision (strong heuristics) ----------------
-   - receives candidates: array of objects { raw, source, ... }
-   - builds numeric entries, includes computed totals from installments
-   - scores candidates and returns formatted "R$ X,XX"
+/* ---------------- final selection ----------------
+   regras:
+   - entries com computedTotal (parcela total) têm grande peso
+   - json-ld / structured data tem prioridade
+   - descartamos valores de parcela (per-installment) se existir total candidato
+   - penalizamos valores < 1 (a não ser que TODOS candidatos sejam <5)
 */
 function finalizePrice(candidates, proximityMap = {}) {
   if (!Array.isArray(candidates) || candidates.length === 0) return null;
 
-  // Build numeric entries
   const entries = [];
+
   for (const c of candidates) {
     if (!c || !c.raw) continue;
     const raw = String(c.raw).trim();
 
-    // if marker for computed installment from xhr structure
     if (c.computedFrom && c.computedFrom.rawValue && c.computedFrom.count) {
       const p = parseNumberFromString(c.computedFrom.rawValue);
       if (p.num) {
-        const total = p.num * Number(c.computedFrom.count);
-        entries.push({ raw, num: total, source: c.source || "xhr", computedTotal: true, info: "computedFromXHR" });
+        entries.push({ raw, num: p.num * Number(c.computedFrom.count), source: c.source || "xhr", computedTotal: true, info: "computedFromXHR" });
         continue;
       }
     }
 
-    // if raw indicates computed_installment_total:<count>x<value>
     const compMatch = raw.match(/^computed_installment_total:(\d+)x(.+)$/i);
     if (compMatch) {
       const cnt = Number(compMatch[1]);
       const valRaw = compMatch[2];
       const p = parseNumberFromString(valRaw);
-      if (p.num) entries.push({ raw, num: p.num * cnt, source: c.source || "xhr", computedTotal: true, info: "computedFromMarker" });
+      if (p.num) entries.push({ raw, num: p.num * cnt, source: c.source || "xhr", computedTotal: true, info: "computedMarker" });
       continue;
     }
 
-    // explicit object produced in collector: isInstallment
     if (c.isInstallment && c.parcelCount && c.parcelValueRaw) {
       const p = parseNumberFromString(c.parcelValueRaw);
       if (p.num) {
         entries.push({ raw, num: p.num * Number(c.parcelCount), source: c.source || "xhr", computedTotal: true, info: "xhr-installment" });
-        // also keep per-installment (lower priority)
         entries.push({ raw: `${raw}_per_installment`, num: p.num, source: c.source || "xhr", isParcel: true, parcelCount: c.parcelCount });
         continue;
       }
     }
 
-    // detect installment inside raw
     const inst = detectInstallmentFromString(raw);
     if (inst && inst.total) {
       entries.push({ raw, num: inst.total, source: c.source || "mixed", computedTotal: true, info: "detected-installment" });
@@ -254,25 +212,21 @@ function finalizePrice(candidates, proximityMap = {}) {
       continue;
     }
 
-    // normal parse
     const p = parseNumberFromString(raw);
     if (p.num) entries.push({ raw, num: p.num, source: c.source || "unknown", note: p.note });
   }
 
   const numeric = entries.filter(e => typeof e.num === "number" && Number.isFinite(e.num) && e.num > 0);
   if (numeric.length === 0) {
-    console.log("No numeric price candidates found from:", candidates);
+    console.log("Nenhum candidato numérico válido:", candidates);
     return null;
   }
 
-  // Build frequency and median for coherence
   const freq = {};
   numeric.forEach(e => { const k = Number(e.num).toFixed(2); freq[k] = (freq[k] || 0) + 1; });
-  const uniqueNums = Array.from(new Set(numeric.map(e => e.num))).sort((a,b)=>a-b);
+  const uniqueNums = Array.from(new Set(numeric.map(e => e.num))).sort((a,b) => a-b);
   const median = uniqueNums.length ? uniqueNums[Math.floor(uniqueNums.length/2)] : null;
-  const maxVal = Math.max(...numeric.map(n => n.num));
 
-  // Score candidates
   const scored = numeric.map(e => {
     let score = 0;
     const src = String(e.source || "");
@@ -281,25 +235,20 @@ function finalizePrice(candidates, proximityMap = {}) {
     if (src.includes("xhr")) score += 12;
     if (src.includes("body")) score += 3;
 
-    if (e.computedTotal) score += 60; // very strong -> totals computed from installments or structured data
+    if (e.computedTotal) score += 60;
+    if (e.isParcel) score -= 30;
 
-    if (e.isParcel) score -= 30; // per-installment is penalized
+    if (/R\$/.test(e.raw)) score += 6;
 
-    // presence of currency symbol in raw gives boost
-    if (/R\$/.test(e.raw)) score += 8;
-
-    // frequency
     const f = freq[Number(e.num).toFixed(2)] || 0;
     score += Math.min(f, 5) * 6;
 
-    // proximity to title/image
     const prox = proximityMap[e.raw] || proximityMap[String(e.raw)] || null;
     if (prox) {
-      if (prox.near) score += 22;
+      if (prox.near) score += 18;
       score += Math.min(prox.count || 0, 5) * 2;
     }
 
-    // coherence with median: penalize absurd outliers
     if (median && median > 0) {
       const ratio = e.num / median;
       if (ratio >= 0.25 && ratio <= 10) score += 4;
@@ -307,13 +256,12 @@ function finalizePrice(candidates, proximityMap = {}) {
       if (ratio > 50) score -= 30;
     }
 
-    // penalize tiny numbers < 1
     if (e.num < 1) score -= 20;
 
     return { ...e, score };
   });
 
-  // if all candidates are small (<5), remove penalty for <1
+  // If all candidates < 5, reward small numbers (handle cheap products)
   const allSmall = uniqueNums.every(n => n < 5);
   if (allSmall) {
     for (const s of scored) {
@@ -351,6 +299,24 @@ async function scrapeProduct(rawUrl) {
     });
 
     const page = await browser.newPage();
+
+    // BLOQUEIO seletivo para acelerar: bloqueia fonts/stylesheets/trackers,
+    // mas permite document/xhr/json para coletar preços rapidamente.
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const url = req.url().toLowerCase();
+      const resourceType = req.resourceType ? req.resourceType() : "";
+      // allow document, xhr, fetch, script; block images/fonts/stylesheets from initial load
+      if (resourceType === 'image' || resourceType === 'stylesheet' || resourceType === 'font') {
+        // but allow og:image meta still accessible without fetching the image file
+        return req.abort();
+      }
+      // block obvious trackers/ad domains
+      const blockedDomains = ['googlesyndication', 'google-analytics', 'analytics', 'doubleclick', 'adsystem', 'adservice', 'facebook', 'hotjar', 'segment'];
+      if (blockedDomains.some(d => url.includes(d))) return req.abort();
+      return req.continue();
+    });
+
     await page.setUserAgent(process.env.USER_AGENT || DEFAULT_USER_AGENT);
     await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
@@ -364,15 +330,16 @@ async function scrapeProduct(rawUrl) {
         await page.goto(cleaned, { waitUntil: "domcontentloaded", timeout: 90000 });
       }
 
-      await page.waitForTimeout(700);
-      await autoScroll(page);
+      // small wait, scroll to trigger lazy load & XHR
       await page.waitForTimeout(600);
+      await autoScroll(page, 1800);
+      await page.waitForTimeout(700);
 
       let title = null;
       let image = null;
       const rawCandidates = [];
 
-      // JSON-LD
+      // 1) JSON-LD (ofertas estruturadas)
       try {
         const blocks = await page.$$eval('script[type="application/ld+json"]', nodes => nodes.map(n => n.textContent).filter(Boolean));
         for (const block of blocks) {
@@ -391,54 +358,67 @@ async function scrapeProduct(rawUrl) {
               const offers = Array.isArray(item.offers) ? item.offers : [item.offers];
               for (const o of offers) {
                 if (o.price) rawCandidates.push({ raw: String(o.price), source: "jsonld" });
-                // some offer specs contain nested price fields
+                // priceSpecification
                 if (o.priceSpecification) {
                   const ps = o.priceSpecification;
                   if (ps.price) rawCandidates.push({ raw: String(ps.price), source: "jsonld" });
-                  if (ps.priceCurrency && ps.price) rawCandidates.push({ raw: `${ps.price}`, source: "jsonld" });
+                  if (ps.priceCurrency && ps.price) rawCandidates.push({ raw: String(ps.price), source: "jsonld" });
+                }
+                // sometimes installments are provided separately
+                if (o.installments && o.installments.number && o.installments.value) {
+                  rawCandidates.push({ raw: `${o.installments.number} x ${o.installments.value}`, source: "jsonld" });
                 }
               }
             }
           }
         }
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) { /* ignore */ }
 
-      // OG fallback
+      // 2) OpenGraph fallback
       const ogTitle = await page.$eval("meta[property='og:title']", e => e.content).catch(() => null);
       if (ogTitle && !title) title = ogTitle;
       const ogImage = await page.$eval("meta[property='og:image']", e => e.content).catch(() => null);
       if (ogImage && !image) image = ogImage;
 
-      // visible selectors
-      const selList = ["[itemprop='price']", ".price", ".product-price", ".sales-price", ".valor", ".priceFinal", ".productPrice", ".price--main", ".product-price-amount"];
+      // 3) visible selectors (prefer content attributes then innerText)
+      const selList = [
+        '[itemprop="price"]',
+        '[itemprop="priceSpecification"]',
+        ".price",
+        ".product-price",
+        ".sales-price",
+        ".best-price",
+        ".valor",
+        ".priceFinal",
+        ".productPrice",
+        ".price--main",
+        ".product-price-amount",
+        ".productPriceAmount"
+      ];
       for (const sel of selList) {
-        const vals = await page.$$eval(sel, els => els.map(e => (e.getAttribute('content') || e.innerText || e.textContent || '').trim()).filter(Boolean)).catch(() => []);
+        const vals = await page.$$eval(sel, els => els.map(e => (e.getAttribute('content') || e.getAttribute('data-price') || e.innerText || e.textContent || '').trim()).filter(Boolean)).catch(() => []);
         for (const v of vals) rawCandidates.push({ raw: v, source: "selector" });
-
         const shadow = await querySelectorShadow(page, sel);
         if (shadow && shadow.text) rawCandidates.push({ raw: shadow.text, source: "selector" });
       }
 
-      // XHR
+      // 4) XHR-derived candidates
       const xhrList = collectXHR();
       for (const o of xhrList) {
         if (!o) continue;
-        // if already object (our collector pushes objects), keep
         if (typeof o === "object" && o.raw) rawCandidates.push(o);
         else rawCandidates.push({ raw: String(o), source: "xhr" });
       }
 
-      // Body fallback
+      // 5) body fallback (broader regex)
       const body = await page.evaluate(() => document.body.innerText).catch(() => "");
       if (body) {
-        // broader regex: includes numbers with thousands separators
+        // captura diversos formatos tipo R$ 1.234,56 e números com separadores
         const matches = Array.from(new Set((body.match(/(?:R\$|\b)\s?[\d\.,]{2,}/g) || []).map(s => s.trim())));
         for (const m of matches) rawCandidates.push({ raw: m, source: "body" });
       }
 
-      // dedupe preserving source variety
+      // dedupe mantendo origem
       const seen = new Set();
       const dedup = [];
       for (const c of rawCandidates) {
@@ -449,9 +429,9 @@ async function scrapeProduct(rawUrl) {
         dedup.push(c);
       }
 
-      console.log("RAW CANDIDATES COLLECTED:", dedup.slice(0,200));
+      console.log("RAW CANDIDATES COLLECTED:", dedup.slice(0,300));
 
-      // proximity map: whether candidate appears near title or image
+      // proximity map (candidatos próximos ao título ou imagem recebem boost)
       const uniqueRaw = Array.from(new Set(dedup.map(c => String(c.raw))));
       const proximityInfo = await page.evaluate((cands, titleText, imageUrl) => {
         const info = {};
@@ -478,7 +458,7 @@ async function scrapeProduct(rawUrl) {
         return info;
       }, uniqueRaw, title || "", image || "");
 
-      // finalize price with robust function
+      // finalize
       const finalPrice = finalizePrice(dedup, proximityInfo);
 
       if (title && typeof title === "string") title = title.split("|")[0].split("-")[0].trim();
