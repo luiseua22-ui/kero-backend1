@@ -12,6 +12,10 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 puppeteer.use(StealthPlugin());
 
 const app = express();
+
+// <-- CORREÇÃO ADICIONADA: evita ValidationError do express-rate-limit com X-Forwarded-For
+app.set("trust proxy", 1);
+
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
