@@ -163,9 +163,11 @@ function parseNumberFromString(raw) {
   let n = Number(t);
   if (!Number.isFinite(n)) return { num: null, note: "not finite" };
 
-  // heuristic: long integer without separators likely centavos
+  // heuristic: long integer without separators likely centavos -> apply conservatively
   const digitsOnly = t.replace(".", "");
-  if (/^\d+$/.test(digitsOnly) && digitsOnly.length >= 6 && n > 10000) {
+  if (/^\d+$/.test(digitsOnly) && digitsOnly.length >= 7 && n > 10000) {
+    // only convert centavos if NOTHING else with currency present (handled by caller),
+    // return marker so caller can decide; but here we provide the candidate as cent/100
     return { num: n / 100, note: "cent heuristic" };
   }
 
@@ -258,48 +260,64 @@ async function findPricesNearCTA(page) {
   });
 }
 
-// ---------------- FINAL PRICE SELECTION (nova estratégia) ----------------
+// ---------------- FINAL PRICE SELECTION (nova estratégia, mais conservadora) ----------------
 function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
-  // candidatesWithMeta: [{ raw, source, info?, computedTotal?, isParcel? }]
-  // Strategy:
-  // 1) If there's JSON-LD with price + currency -> prefer that.
-  // 2) If XHR returned an object with explicit currency/amount fields earlier (we tagged), prefer those.
-  // 3) If there are candidates near CTA (proximityMap marks near:true) prefer those.
-  // 4) Avoid direct parcel values (e.g., single installment amounts) unless no other candidate.
-  // 5) Choose candidate with best combined score of (source weight + proximity + frequency + magnitude plausibility)
-
+  // candidatesWithMeta: [{ raw, source, info?, computedFrom?, isInstallment?, parcelCount?, parcelValueRaw? }]
   if (!Array.isArray(candidatesWithMeta) || candidatesWithMeta.length === 0) return null;
 
-  // parse numeric values and build table
+  // Preprocess and parse candidates conservatively
   const processed = [];
+  let anyWithCurrency = false;
+
   for (const c of candidatesWithMeta) {
     const raw = String(c.raw || "").trim();
     if (!raw) continue;
-
-    // handle computed_installment_total marker like "computed_installment_total:12x609,33"
+    const src = String(c.source || "");
+    // computed_installment_total marker
     const comp = raw.match(/^computed_installment_total:(\d+)x(.+)$/i);
     if (comp) {
       const count = Number(comp[1]);
       const parsed = parseNumberFromString(comp[2]);
       if (parsed.num) {
-        processed.push({ raw, source: c.source || "xhr", num: parsed.num * count, computedTotal: true, isParcel: false });
+        processed.push({ raw, source: src, num: parsed.num * count, computedTotal: true, isParcel: false });
+        if (/R\$/i.test(raw) || /,/.test(raw) || /\./.test(raw)) anyWithCurrency = anyWithCurrency || /R\$/i.test(raw);
         continue;
       }
     }
 
-    // inline installment "12 x R$ 609,33"
+    // detect inline installment
     const inst = detectInstallmentFromString(raw);
     if (inst && inst.total) {
-      processed.push({ raw, source: c.source || "mixed", num: inst.total, computedTotal: true, isParcel: false, note: "detected-installment" });
-      // also push per-installment with isParcel true (lower weight)
-      processed.push({ raw: raw + "_per", source: c.source || "mixed", num: inst.parcelValue, isParcel: true, parcelCount: inst.count });
+      // push total (prefer this)
+      processed.push({ raw, source: src, num: inst.total, computedTotal: true, isParcel: false, note: "detected-installment" });
+      // push installment value too but mark as parcel (penalized)
+      processed.push({ raw: raw + "_per", source: src, num: inst.parcelValue, isParcel: true, parcelCount: inst.count });
+      anyWithCurrency = anyWithCurrency || /R\$/i.test(raw);
       continue;
     }
 
-    // try parse raw
+    // try parse number
     const p = parseNumberFromString(raw);
     if (p.num) {
-      processed.push({ raw, source: c.source || "unknown", num: p.num, isParcel: false, note: p.note });
+      processed.push({ raw, source: src, num: p.num, isParcel: false, note: p.note });
+      if (/R\$/i.test(raw) || raw.includes(",") || raw.includes(".")) anyWithCurrency = anyWithCurrency || /R\$/i.test(raw);
+      continue;
+    }
+
+    // fallback: if raw is pure digits bigger than zero, consider conservatively (but mark)
+    const digitsOnly = raw.replace(/\D/g, "");
+    if (digitsOnly.length > 0 && /^\d+$/.test(digitsOnly)) {
+      const asNum = Number(digitsOnly);
+      if (!Number.isNaN(asNum) && asNum > 0) {
+        // Only consider as currency candidate if digits count is reasonable (<=6) OR there are no other candidates containing 'R$'
+        if (digitsOnly.length <= 6) {
+          // if it looks like cents? we'll treat as integer for now; caller will penalize if needed
+          processed.push({ raw, source: src, num: asNum, inferredInteger: true });
+        } else {
+          // possible sku/ID -> mark as hugeInt
+          processed.push({ raw, source: src, num: asNum, inferredInteger: true, likelyId: true });
+        }
+      }
     }
   }
 
@@ -307,67 +325,102 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
 
   // compute frequency map
   const freq = {};
-  processed.forEach(p => { const k = p.num.toFixed(2); freq[k] = (freq[k] || 0) + 1; });
-
-  // median/typical
-  const uniqueNums = Array.from(new Set(processed.map(p => p.num))).sort((a,b)=>a-b);
-  const median = uniqueNums.length ? uniqueNums[Math.floor(uniqueNums.length/2)] : null;
-  const max = Math.max(...processed.map(p => p.num));
-
-  // scoring
-  const scored = processed.map(p => {
-    let score = 0;
-    const src = String(p.source || "");
-    if (src.includes("jsonld")) score += 60;
-    if (src.includes("selector")) score += 30;
-    if (src.includes("xhr")) score += 18;
-    if (src.includes("body")) score += 4;
-
-    if (p.computedTotal) score += 50;
-    if (p.isParcel) score -= 25; // penalize per-installment values
-
-    // frequency
-    const f = freq[p.num.toFixed(2)] || 0;
-    score += Math.min(f, 5) * 6;
-
-    // proximity boost if raw appears near title/image/cta (proximityMap keyed by raw)
-    try {
-      const prox = proximityMap[p.raw];
-      if (prox) {
-        if (prox.near) score += 24;
-        score += Math.min(prox.count || 0, 5) * 3;
-      }
-    } catch (e) {}
-
-    // plausibility vs median
-    if (median && median > 0) {
-      const ratio = p.num / median;
-      if (ratio >= 0.2 && ratio <= 10) score += 4;
-      if (ratio < 0.02) score -= 12;
-      if (ratio > 50) score -= 18;
-    }
-
-    // penalize extremely small numbers (unless all are small)
-    if (p.num < 1) score -= 15;
-
-    // reward being close to max (we prefer main price, not tiny one)
-    if (median && p.num >= median) score += (p.num / median) * 1.2;
-
-    return { ...p, score };
+  processed.forEach(p => {
+    if (p.num == null) return;
+    const k = Number(p.num).toFixed(2);
+    freq[k] = (freq[k] || 0) + 1;
   });
 
-  // if all candidates are small (<5), relax small-number penalties
+  // metrics
+  const uniqueNums = Array.from(new Set(processed.filter(p => Number.isFinite(p.num)).map(p => p.num))).sort((a,b)=>a-b);
+  const median = uniqueNums.length ? uniqueNums[Math.floor(uniqueNums.length/2)] : null;
+  const max = uniqueNums.length ? Math.max(...uniqueNums) : null;
+
+  // scoring
+  const scored = processed
+    .filter(p => Number.isFinite(p.num))
+    .map(p => {
+      let score = 0;
+      const src = String(p.source || "");
+
+      // Source weight (heavier for structured)
+      if (src.includes("jsonld")) score += 70;
+      else if (src.includes("selector")) score += 40;
+      else if (src.includes("nearCTA")) score += 36;
+      else if (src.includes("xhr")) score += 22;
+      else if (src.includes("body")) score += 6;
+      else score += 5;
+
+      // computed total (installment-derived) gets a big boost
+      if (p.computedTotal) score += 48;
+
+      // installment per-value penalized strongly
+      if (p.isParcel) score -= 45;
+
+      // presence of currency symbol in raw
+      if (/R\$/i.test(p.raw)) score += 12;
+
+      // frequency
+      const f = freq[Number(p.num).toFixed(2)] || 0;
+      score += Math.min(f, 6) * 6;
+
+      // proximity
+      try {
+        const prox = proximityMap[p.raw];
+        if (prox) {
+          if (prox.near) score += 28;
+          score += Math.min(prox.count || 0, 6) * 3;
+        }
+      } catch (e) {}
+
+      // penalize likely IDs / huge ints
+      if (p.likelyId) score -= 90;
+
+      // penalize small numbers (<1) heavily unless all are small
+      if (p.num < 1) score -= 30;
+
+      // prefer values >= median (usually product main price >= many incidental values)
+      if (median && median > 0) {
+        const ratio = p.num / median;
+        if (ratio >= 0.2 && ratio <= 20) score += 4;
+        if (ratio < 0.02) score -= 12;
+        if (ratio > 50) score -= 18;
+      }
+
+      // if there exists at least one candidate that explicitly contains "R$", and this raw does not contain currency, penalize it
+      const hasExplicitCurrency = processed.some(pp => /R\$/i.test(pp.raw));
+      if (hasExplicitCurrency && !/R\$/i.test(p.raw)) score -= 10;
+
+      // penalize absurdly large numbers
+      if (p.num > 1000000) score -= 100;
+
+      // small boost for being near the page max (to prefer the main price over tiny ones)
+      if (max && max > 0) score += (p.num / max) * 2;
+
+      return { ...p, score };
+    });
+
+  // if every candidate is <5 (all are small), relax small-number penalties
   const allSmall = uniqueNums.every(n => n < 5);
   if (allSmall) {
-    scored.forEach(s => { if (s.num < 1) s.score += 20; });
+    scored.forEach(s => { if (s.num < 1) s.score += 18; });
   }
 
   scored.sort((a,b) => b.score - a.score);
 
-  console.log("PRICE CANDIDATES SCORED:", scored.map(s => ({ num: s.num, score: s.score, raw: s.raw, source: s.source, note: s.note })));
+  console.log("PRICE CANDIDATES SCORED:", scored.map(s => ({ num: s.num, score: s.score, raw: s.raw, source: s.source, note: s.note || null })));
 
   const best = scored[0];
   if (!best) return null;
+
+  // Final safety: if best is suspiciously fractional due to previous cent heuristic and there are explicit currency candidates, prefer explicit
+  if (best && /cent heuristic/i.test(best.note || "") && processed.some(p => /R\$/i.test(p.raw))) {
+    const explicit = scored.find(s => /R\$/i.test(s.raw));
+    if (explicit) {
+      return `R$ ${Number(explicit.num).toFixed(2).replace(".", ",")}`;
+    }
+  }
+
   return `R$ ${Number(best.num).toFixed(2).replace(".", ",")}`;
 }
 
