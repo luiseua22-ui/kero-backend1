@@ -1,4 +1,7 @@
 // index.js - scraper completo com nova lógica de preço (prioriza JSON-LD, XHR e proximidade ao CTA)
+// Versão ajustada: detecta parcelas explícitas e emparelha número de parcelas + valor para criar total computado,
+// boosta totals computados para evitar retornar valor por parcela ou valores próximos incorretos.
+
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -96,26 +99,23 @@ function createXHRPriceCollector(page) {
         if (!ctype.includes("application/json")) return;
         const json = await resp.json().catch(() => null);
         if (!json) return;
-        const walk = (o, path = "") => {
+        const walk = (o) => {
           if (!o || typeof o !== "object") return;
           for (const k of Object.keys(o)) {
             const v = o[k];
             const lkey = String(k).toLowerCase();
             if (v === null || v === undefined) continue;
-            // strings / numbers
             if (typeof v === "string" || typeof v === "number") {
               const text = String(v).trim();
-              // detect installment patterns
               const inst = text.match(/(\d{1,3})\s*[xX]\s*(?:de\s*)?R?\$?\s*([\d\.,]+)/i) || text.match(/(\d{1,3})x([\d\.,]+)/i);
               if (inst) {
                 prices.push({ raw: text, source: "xhr", isInstallment: true, parcelCount: Number(inst[1]), parcelValueRaw: inst[2], url });
-                // also push computed candidate (total)
                 prices.push({ raw: `computed_installment_total:${inst[1]}x${inst[2]}`, source: "xhr", computedFrom: { count: Number(inst[1]), rawValue: inst[2] }, url });
               } else if (lkey.includes("price") || lkey.includes("amount") || lkey.includes("value") || lkey.includes("priceamount") || lkey.includes("sale")) {
                 prices.push({ raw: text, source: "xhr", field: k, url });
               }
             }
-            if (typeof v === "object") walk(v, path + "." + k);
+            if (typeof v === "object") walk(v);
           }
         };
         walk(json);
@@ -166,8 +166,6 @@ function parseNumberFromString(raw) {
   // heuristic: long integer without separators likely centavos -> apply conservatively
   const digitsOnly = t.replace(".", "");
   if (/^\d+$/.test(digitsOnly) && digitsOnly.length >= 7 && n > 10000) {
-    // only convert centavos if NOTHING else with currency present (handled by caller),
-    // return marker so caller can decide; but here we provide the candidate as cent/100
     return { num: n / 100, note: "cent heuristic" };
   }
 
@@ -177,7 +175,7 @@ function parseNumberFromString(raw) {
 function detectInstallmentFromString(raw) {
   if (!raw) return null;
   const s = String(raw);
-  const m = s.match(/(\d{1,3})\s*[xX]\s*(?:de\s*)?R?\$?\s*([\d\.,]+)/i) || s.match(/(\d{1,3})x([\d\.,]+)/i);
+  const m = s.match(/(\d{1,3})\s*[xX]\s*(?:de\s*)?R?\$?\s*([\d\.,]+)/i) || s.match(/(\d{1,3})x([\d\.,]+)/i) || s.match(/(\d{1,3})\s*vezes?\s*de\s*R?\$?\s*([\d\.,]+)/i);
   if (!m) return null;
   const count = Number(m[1]);
   const valueRaw = m[2];
@@ -187,7 +185,6 @@ function detectInstallmentFromString(raw) {
 }
 
 // ---------------- NEW: busca preço próximo ao CTA (botão comprar) ----------------
-// Essa função roda IN-Page e retorna array de strings que parecem ser preços próximos aos botões de compra.
 async function findPricesNearCTA(page) {
   return page.evaluate(() => {
     const ctaSelectors = [
@@ -197,30 +194,23 @@ async function findPricesNearCTA(page) {
       "a.add-to-cart", "a[href*='add-to-cart']"
     ];
     const priceCandidates = new Set();
+    const priceRegex = /(?:\d{1,3}\s*[xX]\s*R\$\s*[\d\.,]+|R\$\s?[\d\.,]+)/g;
 
-    // pattern to match prices in text nodes
-    const priceRegex = /R\$\s?[\d\.,]+/g;
-
-    // helper: given an element, collect nearby text nodes (self and ancestors/descendants)
     function collectNearbyTexts(el) {
       const texts = [];
       try {
         if (!el) return texts;
-        // self text
         if (el.innerText) texts.push(el.innerText);
-        // sibling text
         if (el.parentElement) {
           for (const sib of Array.from(el.parentElement.children)) {
             if (sib && sib !== el && sib.innerText) texts.push(sib.innerText);
           }
         }
-        // ancestor text up to 4 levels
         let node = el.parentElement;
         for (let i = 0; i < 4 && node; i++) {
           if (node.innerText) texts.push(node.innerText);
           node = node.parentElement;
         }
-        // descendants
         for (const d of Array.from(el.querySelectorAll ? el.querySelectorAll("*") : [])) {
           if (d.innerText) texts.push(d.innerText);
         }
@@ -235,15 +225,12 @@ async function findPricesNearCTA(page) {
           const texts = collectNearbyTexts(n);
           for (const t of texts) {
             const matches = t.match(priceRegex);
-            if (matches) {
-              matches.forEach(m => priceCandidates.add(m.trim()));
-            }
+            if (matches) matches.forEach(m => priceCandidates.add(m.trim()));
           }
         }
       } catch (e) {}
     }
 
-    // Also, find common CTA text like "Comprar" or "Adicionar" and search their nearest price
     const textCTAs = Array.from(document.querySelectorAll("button, a")).filter(n => {
       const txt = (n.innerText || "").toLowerCase();
       return txt.includes("comprar") || txt.includes("adicionar") || txt.includes("cart") || txt.includes("carrinho") || txt.includes("buy") || txt.includes("add to cart");
@@ -262,68 +249,95 @@ async function findPricesNearCTA(page) {
 
 // ---------------- FINAL PRICE SELECTION (nova estratégia, mais conservadora) ----------------
 function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
-  // candidatesWithMeta: [{ raw, source, info?, computedFrom?, isInstallment?, parcelCount?, parcelValueRaw? }]
   if (!Array.isArray(candidatesWithMeta) || candidatesWithMeta.length === 0) return null;
 
-  // Preprocess and parse candidates conservatively
-  const processed = [];
-  let anyWithCurrency = false;
+  // Ensure candidatesWithMeta includes explicit installment patterns by scanning raws
+  const augmented = [...candidatesWithMeta];
 
-  for (const c of candidatesWithMeta) {
+  // If there are separate numeric-only candidates (like '12') and per-installment candidates ('R$ 609,33'),
+  // try to pair them to create computed totals.
+  const rawStrings = augmented.map(c => String(c.raw || "").trim());
+  // detect per-installment candidates (explicit)
+  const perInstallmentCandidates = augmented.filter(c => detectInstallmentFromString(String(c.raw || "")));
+  // detect standalone numbers that might be parcel counts
+  const standaloneNumbers = augmented
+    .map(c => ({ c, raw: String(c.raw || "").trim() }))
+    .filter(x => /^\d{1,3}$/.test(x.raw))
+    .map(x => Number(x.raw));
+
+  // create computed candidates from explicit per-installment patterns already detected
+  for (const p of augmented) {
+    const inst = detectInstallmentFromString(String(p.raw || ""));
+    if (inst && inst.total) {
+      augmented.push({ raw: `computed_installment_total:${inst.count}x${inst.parcelValue}`, source: p.source || "detected", computedTotal: true });
+    }
+  }
+
+  // pair standalone numbers with per-installment values when explicit 'Nx R$ V' not present
+  if (standaloneNumbers.length && augmented.some(c => !/^\d+$/.test(String(c.raw || "")) && /R\$/i.test(String(c.raw || "")))) {
+    for (const n of standaloneNumbers) {
+      // find candidate values that look like price-per-installment (have R$ or decimal)
+      const pricePerList = augmented.filter(c => /R\$/i.test(String(c.raw || "")) && !detectInstallmentFromString(String(c.raw || "")));
+      for (const per of pricePerList) {
+        const pParsed = parseNumberFromString(per.raw);
+        if (pParsed.num) {
+          const total = pParsed.num * n;
+          augmented.push({ raw: `computed_pair_total:${n}x${per.raw}`, source: "paired", computedTotal: true, numComputed: total });
+        }
+      }
+    }
+  }
+
+  // Now process augmented
+  const processed = [];
+  for (const c of augmented) {
     const raw = String(c.raw || "").trim();
     if (!raw) continue;
-    const src = String(c.source || "");
-    // computed_installment_total marker
-    const comp = raw.match(/^computed_installment_total:(\d+)x(.+)$/i);
+
+    // handle computed markers
+    const comp = raw.match(/^computed_installment_total:(\d+)x(.+)$/i) || raw.match(/^computed_pair_total:(\d+)x(.+)$/i);
     if (comp) {
       const count = Number(comp[1]);
       const parsed = parseNumberFromString(comp[2]);
       if (parsed.num) {
-        processed.push({ raw, source: src, num: parsed.num * count, computedTotal: true, isParcel: false });
-        if (/R\$/i.test(raw) || /,/.test(raw) || /\./.test(raw)) anyWithCurrency = anyWithCurrency || /R\$/i.test(raw);
+        processed.push({ raw, source: c.source || "computed", num: parsed.num * count, computedTotal: true, isParcel: false });
+        continue;
+      }
+      // if pattern is computed_pair_total:12xR$ 609,33 we might have 'numComputed' passed
+      if (c.numComputed) {
+        processed.push({ raw, source: c.source || "computed", num: c.numComputed, computedTotal: true, isParcel: false });
         continue;
       }
     }
 
-    // detect inline installment
+    // detect inline installments
     const inst = detectInstallmentFromString(raw);
     if (inst && inst.total) {
-      // push total (prefer this)
-      processed.push({ raw, source: src, num: inst.total, computedTotal: true, isParcel: false, note: "detected-installment" });
-      // push installment value too but mark as parcel (penalized)
-      processed.push({ raw: raw + "_per", source: src, num: inst.parcelValue, isParcel: true, parcelCount: inst.count });
-      anyWithCurrency = anyWithCurrency || /R\$/i.test(raw);
+      processed.push({ raw, source: c.source || "mixed", num: inst.total, computedTotal: true, isParcel: false, note: "detected-installment" });
+      processed.push({ raw: raw + "_per", source: c.source || "mixed", num: inst.parcelValue, isParcel: true, parcelCount: inst.count });
       continue;
     }
 
-    // try parse number
+    // try parse raw
     const p = parseNumberFromString(raw);
     if (p.num) {
-      processed.push({ raw, source: src, num: p.num, isParcel: false, note: p.note });
-      if (/R\$/i.test(raw) || raw.includes(",") || raw.includes(".")) anyWithCurrency = anyWithCurrency || /R\$/i.test(raw);
+      processed.push({ raw, source: c.source || "unknown", num: p.num, isParcel: false, note: p.note });
       continue;
     }
 
-    // fallback: if raw is pure digits bigger than zero, consider conservatively (but mark)
+    // fallback numeric-only
     const digitsOnly = raw.replace(/\D/g, "");
     if (digitsOnly.length > 0 && /^\d+$/.test(digitsOnly)) {
       const asNum = Number(digitsOnly);
       if (!Number.isNaN(asNum) && asNum > 0) {
-        // Only consider as currency candidate if digits count is reasonable (<=6) OR there are no other candidates containing 'R$'
-        if (digitsOnly.length <= 6) {
-          // if it looks like cents? we'll treat as integer for now; caller will penalize if needed
-          processed.push({ raw, source: src, num: asNum, inferredInteger: true });
-        } else {
-          // possible sku/ID -> mark as hugeInt
-          processed.push({ raw, source: src, num: asNum, inferredInteger: true, likelyId: true });
-        }
+        if (digitsOnly.length <= 6) processed.push({ raw, source: c.source || "unknown", num: asNum, inferredInteger: true });
+        else processed.push({ raw, source: c.source || "unknown", num: asNum, inferredInteger: true, likelyId: true });
       }
     }
   }
 
   if (processed.length === 0) return null;
 
-  // compute frequency map
   const freq = {};
   processed.forEach(p => {
     if (p.num == null) return;
@@ -331,19 +345,16 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
     freq[k] = (freq[k] || 0) + 1;
   });
 
-  // metrics
   const uniqueNums = Array.from(new Set(processed.filter(p => Number.isFinite(p.num)).map(p => p.num))).sort((a,b)=>a-b);
   const median = uniqueNums.length ? uniqueNums[Math.floor(uniqueNums.length/2)] : null;
   const max = uniqueNums.length ? Math.max(...uniqueNums) : null;
 
-  // scoring
   const scored = processed
     .filter(p => Number.isFinite(p.num))
     .map(p => {
       let score = 0;
       const src = String(p.source || "");
 
-      // Source weight (heavier for structured)
       if (src.includes("jsonld")) score += 70;
       else if (src.includes("selector")) score += 40;
       else if (src.includes("nearCTA")) score += 36;
@@ -351,20 +362,14 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
       else if (src.includes("body")) score += 6;
       else score += 5;
 
-      // computed total (installment-derived) gets a big boost
-      if (p.computedTotal) score += 48;
-
-      // installment per-value penalized strongly
+      if (p.computedTotal) score += 70; // **MAJOR BOOST** para totais computados
       if (p.isParcel) score -= 45;
 
-      // presence of currency symbol in raw
       if (/R\$/i.test(p.raw)) score += 12;
 
-      // frequency
       const f = freq[Number(p.num).toFixed(2)] || 0;
       score += Math.min(f, 6) * 6;
 
-      // proximity
       try {
         const prox = proximityMap[p.raw];
         if (prox) {
@@ -373,13 +378,9 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
         }
       } catch (e) {}
 
-      // penalize likely IDs / huge ints
       if (p.likelyId) score -= 90;
-
-      // penalize small numbers (<1) heavily unless all are small
       if (p.num < 1) score -= 30;
 
-      // prefer values >= median (usually product main price >= many incidental values)
       if (median && median > 0) {
         const ratio = p.num / median;
         if (ratio >= 0.2 && ratio <= 20) score += 4;
@@ -387,20 +388,14 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
         if (ratio > 50) score -= 18;
       }
 
-      // if there exists at least one candidate that explicitly contains "R$", and this raw does not contain currency, penalize it
       const hasExplicitCurrency = processed.some(pp => /R\$/i.test(pp.raw));
       if (hasExplicitCurrency && !/R\$/i.test(p.raw)) score -= 10;
-
-      // penalize absurdly large numbers
       if (p.num > 1000000) score -= 100;
-
-      // small boost for being near the page max (to prefer the main price over tiny ones)
       if (max && max > 0) score += (p.num / max) * 2;
 
       return { ...p, score };
     });
 
-  // if every candidate is <5 (all are small), relax small-number penalties
   const allSmall = uniqueNums.every(n => n < 5);
   if (allSmall) {
     scored.forEach(s => { if (s.num < 1) s.score += 18; });
@@ -413,7 +408,7 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
   const best = scored[0];
   if (!best) return null;
 
-  // Final safety: if best is suspiciously fractional due to previous cent heuristic and there are explicit currency candidates, prefer explicit
+  // final safety: if best came from "cent heuristic" but explicit R$ candidate exists, prefer explicit
   if (best && /cent heuristic/i.test(best.note || "") && processed.some(p => /R\$/i.test(p.raw))) {
     const explicit = scored.find(s => /R\$/i.test(s.raw));
     if (explicit) {
@@ -446,14 +441,12 @@ async function scrapeProduct(rawUrl) {
 
     const page = await browser.newPage();
 
-    // block heavy resources but keep them for image meta detection (we will still read og:image)
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       try {
         const url = req.url().toLowerCase();
         const resourceType = req.resourceType ? req.resourceType() : "";
         if (resourceType === "font" || resourceType === "stylesheet") return req.abort();
-        // allow images because we may need actual <img> src, but if too slow, can abort
         const blocked = ["googlesyndication", "google-analytics", "doubleclick", "adsystem", "adservice", "facebook", "hotjar", "segment", "matomo", "ads", "tracking"];
         if (blocked.some(d => url.includes(d))) return req.abort();
       } catch (e) {}
@@ -466,7 +459,6 @@ async function scrapeProduct(rawUrl) {
     const collectXHR = createXHRPriceCollector(page);
 
     try {
-      // navigation with fallback
       try {
         await page.goto(cleaned, { waitUntil: "networkidle2", timeout: 60000 });
       } catch (err) {
@@ -474,17 +466,15 @@ async function scrapeProduct(rawUrl) {
         await page.goto(cleaned, { waitUntil: "domcontentloaded", timeout: 90000 });
       }
 
-      // quick waits & scrolls
       await page.waitForTimeout(600);
       await autoScroll(page, 1800);
       await page.waitForTimeout(700);
 
-      // keep name & image logic as-is (do not change)
       let title = null;
       let image = null;
       const candidates = [];
 
-      // 1) JSON-LD (structured)
+      // JSON-LD
       try {
         const blocks = await page.$$eval('script[type="application/ld+json"]', nodes => nodes.map(n => n.textContent).filter(Boolean));
         for (const block of blocks) {
@@ -499,14 +489,11 @@ async function scrapeProduct(rawUrl) {
               const img = Array.isArray(item.image) ? item.image[0] : item.image;
               image = typeof img === "object" ? img.url || img.contentUrl : img;
             }
-            // offers -> price
             if (item.offers) {
               const offers = Array.isArray(item.offers) ? item.offers : [item.offers];
               for (const o of offers) {
                 if (o.price) candidates.push({ raw: String(o.price), source: "jsonld" });
-                // if currency available prefer price + currency
                 if (o.price && o.priceCurrency) candidates.push({ raw: `${o.priceCurrency} ${o.price}`, source: "jsonld" });
-                // installments in structured data
                 if (o.installments && o.installments.number && o.installments.price) {
                   candidates.push({ raw: `${o.installments.number} x ${o.installments.price}`, source: "jsonld" });
                 }
@@ -516,13 +503,13 @@ async function scrapeProduct(rawUrl) {
         }
       } catch (e) { /* ignore */ }
 
-      // 2) OpenGraph fallback for title/image
+      // OpenGraph fallback
       const ogTitle = await page.$eval("meta[property='og:title']", e => e.content).catch(() => null);
       if (ogTitle && !title) title = ogTitle;
       const ogImage = await page.$eval("meta[property='og:image']", e => e.content).catch(() => null);
       if (ogImage && !image) image = ogImage;
 
-      // 3) visible selectors (gather many candidates)
+      // visible selectors
       const selectorList = [
         '[itemprop="price"]',
         '[itemprop="priceSpecification"]',
@@ -547,7 +534,7 @@ async function scrapeProduct(rawUrl) {
         if (shadow && shadow.src && !image) image = shadow.src;
       }
 
-      // 4) XHR candidates collected
+      // XHR
       const xhrList = collectXHR();
       for (const o of xhrList) {
         if (!o) continue;
@@ -555,15 +542,33 @@ async function scrapeProduct(rawUrl) {
         else candidates.push({ raw: String(o), source: "xhr" });
       }
 
-      // 5) search prices near CTA (NEW APPROACH: proximity)
+      // near CTA
       const nearCTAPrices = await findPricesNearCTA(page).catch(() => []);
       for (const p of nearCTAPrices) candidates.push({ raw: p, source: "nearCTA" });
 
-      // 6) body fallback
+      // body fallback - agora captura parcelamentos explícitos também
       const body = await page.evaluate(() => document.body.innerText).catch(() => "");
       if (body) {
-        const matches = Array.from(new Set((body.match(/(?:R\$|\b)\s?[\d\.,]{2,}/g) || []).map(s => s.trim())));
-        for (const m of matches) candidates.push({ raw: m, source: "body" });
+        const matches = new Set();
+        // capture installment forms like "12 x R$ 609,33" and "R$ 7.312"
+        const instRegex = /(\d{1,3}\s*[xX]\s*(?:de\s*)?R?\$?\s*[\d\.,]+)/g;
+        const currencyRegex = /R\$\s?[\d\.,]+/g;
+        const plainNumberRegex = /\b\d{1,3}\b/g;
+
+        const instFound = body.match(instRegex) || [];
+        instFound.forEach(s => matches.add(s.trim()));
+
+        const currFound = body.match(currencyRegex) || [];
+        currFound.forEach(s => matches.add(s.trim()));
+
+        // also add isolated small integers that might be parcel counts (12, 10, etc.) — careful but useful
+        const maybeCounts = body.match(plainNumberRegex) || [];
+        maybeCounts.forEach(s => {
+          const n = Number(s);
+          if (!isNaN(n) && n >= 2 && n <= 60) matches.add(String(s));
+        });
+
+        for (const m of Array.from(matches)) candidates.push({ raw: m, source: "body" });
       }
 
       // dedupe preserving first source
@@ -579,7 +584,7 @@ async function scrapeProduct(rawUrl) {
 
       console.log("RAW PRICE CANDIDATES:", dedup.slice(0, 200));
 
-      // proximity info: compute counts/near flags for each unique raw string
+      // proximity info
       const uniqueRaw = Array.from(new Set(dedup.map(c => String(c.raw))));
       const proximityInfo = await page.evaluate((cands, titleText, imageUrl) => {
         const info = {};
@@ -606,7 +611,7 @@ async function scrapeProduct(rawUrl) {
         return info;
       }, uniqueRaw, title || "", image || "");
 
-      // final price selection using new strategy
+      // final price selection
       const finalPrice = selectBestPrice(dedup, proximityInfo);
 
       if (title && typeof title === "string") title = title.split("|")[0].split("-")[0].trim();
