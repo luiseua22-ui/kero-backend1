@@ -1,6 +1,5 @@
 // index.js - scraper completo com nova lógica de preço (prioriza JSON-LD, XHR e proximidade ao CTA)
-// Versão ajustada: detecta parcelas explícitas e emparelha número de parcelas + valor para criar total computado,
-// boosta totals computados para evitar retornar valor por parcela ou valores próximos incorretos.
+// Versão final: detecta parcelas, computa totais, traz tracing/debug detalhado no retorno da API.
 
 import express from "express";
 import cors from "cors";
@@ -13,7 +12,7 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 
-// <-- CORREÇÃO ADICIONADA: evita ValidationError do express-rate-limit com X-Forwarded-For
+// evita ValidationError do express-rate-limit com X-Forwarded-For
 app.set("trust proxy", 1);
 
 app.use(cors());
@@ -252,77 +251,79 @@ async function findPricesNearCTA(page) {
 }
 
 // ---------------- FINAL PRICE SELECTION (nova estratégia, mais conservadora) ----------------
-function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
-  if (!Array.isArray(candidatesWithMeta) || candidatesWithMeta.length === 0) return null;
+function selectBestPrice(candidatesWithMeta, proximityMap = {}, debug) {
+  // debug is an object we push traces into
+  if (!Array.isArray(candidatesWithMeta) || candidatesWithMeta.length === 0) {
+    debug.reason = "no_candidates";
+    return null;
+  }
 
-  // Ensure candidatesWithMeta includes explicit installment patterns by scanning raws
-  const augmented = [...candidatesWithMeta];
+  // copy and augment
+  const augmented = candidatesWithMeta.slice();
 
-  // If there are separate numeric-only candidates (like '12') and per-installment candidates ('R$ 609,33'),
-  // try to pair them to create computed totals.
-  const rawStrings = augmented.map(c => String(c.raw || "").trim());
-  // detect per-installment candidates (explicit)
-  const perInstallmentCandidates = augmented.filter(c => detectInstallmentFromString(String(c.raw || "")));
-  // detect standalone numbers that might be parcel counts
+  // ---------- pairings and computed totals ----------
+  // detect standalone numbers and pair to price-per-installment candidates to create computed totals
   const standaloneNumbers = augmented
     .map(c => ({ c, raw: String(c.raw || "").trim() }))
     .filter(x => /^\d{1,3}$/.test(x.raw))
     .map(x => Number(x.raw));
 
-  // create computed candidates from explicit per-installment patterns already detected
-  for (const p of augmented) {
+  // add computed totals for explicit "Nx R$ V" already present
+  for (const p of augmented.slice()) {
     const inst = detectInstallmentFromString(String(p.raw || ""));
     if (inst && inst.total) {
-      augmented.push({ raw: `computed_installment_total:${inst.count}x${inst.parcelValue}`, source: p.source || "detected", computedTotal: true });
+      augmented.push({ raw: `computed_installment_total:${inst.count}x${inst.parcelValue}`, source: p.source || "detected", computedTotal: true, from: p.raw });
     }
   }
 
-  // pair standalone numbers with per-installment values when explicit 'Nx R$ V' not present
-  if (standaloneNumbers.length && augmented.some(c => !/^\d+$/.test(String(c.raw || "")) && /R\$/i.test(String(c.raw || "")))) {
+  // pair standalone numbers with R$ values (if makes sense)
+  if (standaloneNumbers.length && augmented.some(c => /R\$/i.test(String(c.raw || "")))) {
     for (const n of standaloneNumbers) {
-      // find candidate values that look like price-per-installment (have R$ or decimal)
       const pricePerList = augmented.filter(c => /R\$/i.test(String(c.raw || "")) && !detectInstallmentFromString(String(c.raw || "")));
       for (const per of pricePerList) {
-        const pParsed = parseNumberFromString(per.raw);
-        if (pParsed.num) {
-          const total = pParsed.num * n;
-          augmented.push({ raw: `computed_pair_total:${n}x${per.raw}`, source: "paired", computedTotal: true, numComputed: total });
+        const parsed = parseNumberFromString(per.raw);
+        if (parsed.num) {
+          const total = parsed.num * n;
+          augmented.push({ raw: `computed_pair_total:${n}x${per.raw}`, source: "paired", computedTotal: true, numComputed: total, from: `${n} x ${per.raw}` });
         }
       }
     }
   }
 
-  // Now process augmented
+  // ---------- normalized processing ----------
   const processed = [];
   for (const c of augmented) {
     const raw = String(c.raw || "").trim();
     if (!raw) continue;
 
-    // handle computed markers
+    // computed markers
     const comp = raw.match(/^computed_installment_total:(\d+)x(.+)$/i) || raw.match(/^computed_pair_total:(\d+)x(.+)$/i);
     if (comp) {
       const count = Number(comp[1]);
       const parsed = parseNumberFromString(comp[2]);
       if (parsed.num) {
-        processed.push({ raw, source: c.source || "computed", num: parsed.num * count, computedTotal: true, isParcel: false });
+        const total = parsed.num * count;
+        processed.push({ raw, source: c.source || "computed", num: total, computedTotal: true, note: parsed.note || null, extra: c });
+        debug.trace && debug.trace.push({ action: "computed_marker_parsed", raw, total });
         continue;
       }
-      // if pattern is computed_pair_total:12xR$ 609,33 we might have 'numComputed' passed
       if (c.numComputed) {
-        processed.push({ raw, source: c.source || "computed", num: c.numComputed, computedTotal: true, isParcel: false });
+        processed.push({ raw, source: c.source || "computed", num: c.numComputed, computedTotal: true, note: "numComputed" });
+        debug.trace && debug.trace.push({ action: "computed_marker_numComputed", raw, numComputed: c.numComputed });
         continue;
       }
     }
 
-    // detect inline installments
+    // inline installment detection
     const inst = detectInstallmentFromString(raw);
     if (inst && inst.total) {
-      processed.push({ raw, source: c.source || "mixed", num: inst.total, computedTotal: true, isParcel: false, note: "detected-installment" });
+      processed.push({ raw, source: c.source || "mixed", num: inst.total, computedTotal: true, note: "detected-installment" });
       processed.push({ raw: raw + "_per", source: c.source || "mixed", num: inst.parcelValue, isParcel: true, parcelCount: inst.count });
+      debug.trace && debug.trace.push({ action: "installment_detected", raw, parsed: inst });
       continue;
     }
 
-    // try parse raw
+    // parse normally
     const p = parseNumberFromString(raw);
     if (p.num) {
       processed.push({ raw, source: c.source || "unknown", num: p.num, isParcel: false, note: p.note });
@@ -340,7 +341,12 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
     }
   }
 
-  if (processed.length === 0) return null;
+  debug.processedCandidates = processed.map(p => ({ raw: p.raw, num: p.num, note: p.note || null, source: p.source }));
+
+  if (processed.length === 0) {
+    debug.reason = "no_processed_numeric_candidates";
+    return null;
+  }
 
   const freq = {};
   processed.forEach(p => {
@@ -366,7 +372,7 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
       else if (src.includes("body")) score += 6;
       else score += 5;
 
-      if (p.computedTotal) score += 70; // **MAJOR BOOST** para totais computados
+      if (p.computedTotal) score += 70; // boost for computed totals
       if (p.isParcel) score -= 45;
 
       if (/R\$/i.test(p.raw)) score += 12;
@@ -407,18 +413,24 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
 
   scored.sort((a,b) => b.score - a.score);
 
-  console.log("PRICE CANDIDATES SCORED:", scored.map(s => ({ num: s.num, score: s.score, raw: s.raw, source: s.source, note: s.note || null })));
+  debug.scored = scored.map(s => ({ raw: s.raw, num: s.num, score: s.score, source: s.source, note: s.note || null }));
 
   const best = scored[0];
-  if (!best) return null;
+  if (!best) {
+    debug.reason = "no_best_candidate";
+    return null;
+  }
 
-  // final safety: if best came from "cent heuristic" but explicit R$ candidate exists, prefer explicit
+  // safety: if best comes from cent heuristic but there's explicit R$ candidate, prefer explicit
   if (best && /cent heuristic/i.test(best.note || "") && processed.some(p => /R\$/i.test(p.raw))) {
     const explicit = scored.find(s => /R\$/i.test(s.raw));
     if (explicit) {
+      debug.finalChoice = { chosen: explicit, reason: "explicit_currency_preferred_over_cent_heuristic" };
       return `R$ ${Number(explicit.num).toFixed(2).replace(".", ",")}`;
     }
   }
+
+  debug.finalChoice = { chosen: best, reason: "highest_score" };
 
   return `R$ ${Number(best.num).toFixed(2).replace(".", ",")}`;
 }
@@ -426,10 +438,13 @@ function selectBestPrice(candidatesWithMeta, proximityMap = {}) {
 // ---------------- main scraper ----------------
 async function scrapeProduct(rawUrl) {
   return queue.add(async () => {
+    const debug = { trace: [], processedCandidates: null, scored: null, finalChoice: null, reason: null };
     const cleaned = sanitizeIncomingUrl(rawUrl);
+    debug.rawUrl = rawUrl;
+    debug.cleaned = cleaned;
     console.log("URL RECEBIDA:", rawUrl);
     console.log("URL SANITIZADA:", cleaned);
-    if (!cleaned) return { success: false, error: "URL inválida" };
+    if (!cleaned) return { success: false, error: "URL inválida", debug };
 
     const browser = await puppeteer.launch({
       headless: process.env.PUPPETEER_HEADLESS === "false" ? false : "new",
@@ -467,6 +482,7 @@ async function scrapeProduct(rawUrl) {
         await page.goto(cleaned, { waitUntil: "networkidle2", timeout: 60000 });
       } catch (err) {
         console.warn("networkidle2 falhou, tentando domcontentloaded:", err && (err.message || err));
+        debug.trace.push({ action: "navigation_fallback", message: String(err) });
         await page.goto(cleaned, { waitUntil: "domcontentloaded", timeout: 90000 });
       }
 
@@ -483,7 +499,7 @@ async function scrapeProduct(rawUrl) {
         const blocks = await page.$$eval('script[type="application/ld+json"]', nodes => nodes.map(n => n.textContent).filter(Boolean));
         for (const block of blocks) {
           let parsed = null;
-          try { parsed = JSON.parse(block); } catch (e) { parsed = null; }
+          try { parsed = JSON.parse(block); } catch (e) { parsed = null; debug.trace.push({ action: "jsonld_parse_error", error: String(e) }); }
           if (!parsed) continue;
           const list = Array.isArray(parsed) ? parsed : [parsed];
           for (const item of list.flat()) {
@@ -496,22 +512,23 @@ async function scrapeProduct(rawUrl) {
             if (item.offers) {
               const offers = Array.isArray(item.offers) ? item.offers : [item.offers];
               for (const o of offers) {
-                if (o.price) candidates.push({ raw: String(o.price), source: "jsonld" });
-                if (o.price && o.priceCurrency) candidates.push({ raw: `${o.priceCurrency} ${o.price}`, source: "jsonld" });
+                if (o.price) { candidates.push({ raw: String(o.price), source: "jsonld" }); debug.trace.push({ action: "jsonld_price", raw: String(o.price) }); }
+                if (o.price && o.priceCurrency) { candidates.push({ raw: `${o.priceCurrency} ${o.price}`, source: "jsonld" }); debug.trace.push({ action: "jsonld_price_currency", raw: `${o.priceCurrency} ${o.price}` }); }
                 if (o.installments && o.installments.number && o.installments.price) {
                   candidates.push({ raw: `${o.installments.number} x ${o.installments.price}`, source: "jsonld" });
+                  debug.trace.push({ action: "jsonld_installments", raw: `${o.installments.number} x ${o.installments.price}` });
                 }
               }
             }
           }
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) { debug.trace.push({ action: "jsonld_top_error", error: String(e) }); }
 
       // OpenGraph fallback
       const ogTitle = await page.$eval("meta[property='og:title']", e => e.content).catch(() => null);
-      if (ogTitle && !title) title = ogTitle;
+      if (ogTitle && !title) { title = ogTitle; debug.trace.push({ action: "og_title_used", raw: ogTitle }); }
       const ogImage = await page.$eval("meta[property='og:image']", e => e.content).catch(() => null);
-      if (ogImage && !image) image = ogImage;
+      if (ogImage && !image) { image = ogImage; debug.trace.push({ action: "og_image_used", raw: ogImage }); }
 
       // visible selectors
       const selectorList = [
@@ -532,29 +549,30 @@ async function scrapeProduct(rawUrl) {
       ];
       for (const sel of selectorList) {
         const vals = await page.$$eval(sel, els => els.map(e => (e.getAttribute('content') || e.getAttribute('data-price') || e.getAttribute('data-price-amount') || (e.innerText || e.textContent || '').trim())).filter(Boolean)).catch(() => []);
-        for (const v of vals) candidates.push({ raw: v, source: "selector" });
+        for (const v of vals) { candidates.push({ raw: v, source: "selector" }); debug.trace.push({ action: "selector_found", sel, raw: v }); }
         const shadow = await querySelectorShadowReturn(page, sel).catch(() => null);
-        if (shadow && shadow.text) candidates.push({ raw: shadow.text, source: "selector" });
-        if (shadow && shadow.src && !image) image = shadow.src;
+        if (shadow && shadow.text) { candidates.push({ raw: shadow.text, source: "selector" }); debug.trace.push({ action: "shadow_selector", sel, raw: shadow.text }); }
+        if (shadow && shadow.src && !image) { image = shadow.src; debug.trace.push({ action: "shadow_image_used", src: shadow.src }); }
       }
 
       // XHR
       const xhrList = collectXHR();
+      debug.trace.push({ action: "xhr_count", count: xhrList.length || 0 });
       for (const o of xhrList) {
         if (!o) continue;
-        if (typeof o === "object" && o.raw) candidates.push(o);
-        else candidates.push({ raw: String(o), source: "xhr" });
+        if (typeof o === "object" && o.raw) { candidates.push(o); debug.trace.push({ action: "xhr_candidate", raw: o.raw, meta: o }); }
+        else { candidates.push({ raw: String(o), source: "xhr" }); debug.trace.push({ action: "xhr_candidate_raw", raw: String(o) }); }
       }
 
       // near CTA
       const nearCTAPrices = await findPricesNearCTA(page).catch(() => []);
-      for (const p of nearCTAPrices) candidates.push({ raw: p, source: "nearCTA" });
+      debug.trace.push({ action: "near_cta_count", count: nearCTAPrices.length || 0 });
+      for (const p of nearCTAPrices) { candidates.push({ raw: p, source: "nearCTA" }); debug.trace.push({ action: "nearcta_candidate", raw: p }); }
 
-      // body fallback - agora captura parcelamentos explícitos também
+      // body fallback - captures parcelamentos
       const body = await page.evaluate(() => document.body.innerText).catch(() => "");
       if (body) {
         const matches = new Set();
-        // capture installment forms like "12 x R$ 609,33" and "R$ 7.312"
         const instRegex = /(\d{1,3}\s*[xX]\s*(?:de\s*)?R?\$?\s*[\d\.,]+)/g;
         const currencyRegex = /R\$\s?[\d\.,]+/g;
         const plainNumberRegex = /\b\d{1,3}\b/g;
@@ -565,14 +583,13 @@ async function scrapeProduct(rawUrl) {
         const currFound = body.match(currencyRegex) || [];
         currFound.forEach(s => matches.add(s.trim()));
 
-        // also add isolated small integers that might be parcel counts (12, 10, etc.) — careful but useful
         const maybeCounts = body.match(plainNumberRegex) || [];
         maybeCounts.forEach(s => {
           const n = Number(s);
           if (!isNaN(n) && n >= 2 && n <= 60) matches.add(String(s));
         });
 
-        for (const m of Array.from(matches)) candidates.push({ raw: m, source: "body" });
+        for (const m of Array.from(matches)) { candidates.push({ raw: m, source: "body" }); debug.trace.push({ action: "body_candidate", raw: m }); }
       }
 
       // dedupe preserving first source
@@ -587,6 +604,7 @@ async function scrapeProduct(rawUrl) {
       }
 
       console.log("RAW PRICE CANDIDATES:", dedup.slice(0, 200));
+      debug.rawCandidates = dedup.slice(0, 200);
 
       // proximity info
       const uniqueRaw = Array.from(new Set(dedup.map(c => String(c.raw))));
@@ -615,25 +633,30 @@ async function scrapeProduct(rawUrl) {
         return info;
       }, uniqueRaw, title || "", image || "");
 
+      debug.proximityInfo = proximityInfo;
+
       // final price selection
-      const finalPrice = selectBestPrice(dedup, proximityInfo);
+      const finalPrice = selectBestPrice(dedup, proximityInfo, debug);
 
       if (title && typeof title === "string") title = title.split("|")[0].split("-")[0].trim();
 
       await browser.close();
 
+      // Build the response including debug detail
       return {
         success: true,
         url: cleaned,
         title: title || null,
         price: finalPrice || null,
         image: image || null,
-        rawCandidatesCount: dedup.length
+        rawCandidatesCount: dedup.length,
+        debug // full debug object
       };
     } catch (err) {
       await browser.close().catch(() => {});
       console.error("SCRAPER ERROR:", err && (err.message || err));
-      return { success: false, error: String(err) };
+      debug.error = String(err);
+      return { success: false, error: String(err), debug };
     }
   });
 }
