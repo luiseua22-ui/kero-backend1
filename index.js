@@ -1,5 +1,6 @@
 // index.js - scraper completo com nova lógica de preço e Busca Integrada (Mercado Livre + Google)
 // Versão final: Correção do bug de divisão por 100 (cent heuristic) para grandes valores.
+// UPDATE: Adicionado User-Agent na requisição do Mercado Livre para evitar bloqueio.
 
 import express from "express";
 import cors from "cors";
@@ -35,7 +36,14 @@ const DEFAULT_USER_AGENT =
 async function searchMercadoLivre(query) {
   try {
     const url = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(query)}&limit=10`;
-    const response = await axios.get(url);
+    
+    // CORREÇÃO APLICADA: Headers para simular navegador e evitar bloqueio
+    const response = await axios.get(url, {
+        headers: {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+        }
+    });
     
     return response.data.results.map(item => ({
       title: item.title,
@@ -46,6 +54,7 @@ async function searchMercadoLivre(query) {
     }));
   } catch (error) {
     console.error('Erro no ML:', error.message);
+    // Se der erro (bloqueio), retorna array vazio
     return [];
   }
 }
@@ -54,7 +63,7 @@ async function searchMercadoLivre(query) {
 async function searchGoogleShopping(query) {
   try {
     const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'User-Agent': DEFAULT_USER_AGENT,
       'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
     };
 
@@ -800,16 +809,7 @@ app.post("/scrape", async (req, res) => {
                 if (mlResults[i]) combined.push(mlResults[i]);
                 if (googleResults[i]) combined.push(googleResults[i]);
             }
-
-            // O Frontend espera um array direto ou um objeto?
-            // O frontend (api.ts) na função searchProducts espera um ARRAY.
-            // O endpoint /scrape original retornava um objeto { success: true }.
-            // Se o frontend mandar o termo de busca para este endpoint, ele vai receber um array.
             
-            // ATENÇÃO: O código do frontend atual trata a resposta com await resp.text() e JSON.parse.
-            // Se o resultado for um array, o parse vai funcionar.
-            
-            // Retorna o array de produtos diretamente se for busca
             res.json(combined);
         }
 
