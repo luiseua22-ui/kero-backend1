@@ -1,6 +1,6 @@
 // index.js - scraper completo com nova lógica de preço e Busca Integrada (Mercado Livre + Google)
 // Versão final: Correção do bug de divisão por 100 (cent heuristic) para grandes valores.
-// UPDATE: Adicionado User-Agent na requisição do Mercado Livre para evitar bloqueio.
+// UPDATE: Usando apenas scraping web para Mercado Livre devido a bloqueio da API
 
 import express from "express";
 import cors from "cors";
@@ -32,87 +32,74 @@ const DEFAULT_USER_AGENT =
 
 // ---------------- LÓGICA DE BUSCA (NOVO) ----------------
 
-// 1. API Oficial do Mercado Livre (Garantida e Rápida) - VERSÃO CORRIGIDA
+// 1. SCRAPING Mercado Livre (Alternativa devido a bloqueio da API)
 async function searchMercadoLivre(query) {
   try {
-    const url = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(query)}&limit=10`;
+    const searchUrl = `https://lista.mercadolivre.com.br/${encodeURIComponent(query.replace(/\s+/g, '-'))}`;
     
-    // Headers mais completos para simular navegador real
     const headers = {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept": "application/json, text/plain, */*",
+      "User-Agent": DEFAULT_USER_AGENT,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
       "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
       "Accept-Encoding": "gzip, deflate, br",
       "Connection": "keep-alive",
-      "Sec-Fetch-Dest": "empty",
-      "Sec-Fetch-Mode": "cors",
-      "Sec-Fetch-Site": "cross-site",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
       "Cache-Control": "no-cache",
-      "Pragma": "no-cache"
+      "Pragma": "no-cache",
+      "Upgrade-Insecure-Requests": "1"
     };
 
-    const response = await axios.get(url, { 
+    console.log(`Fazendo scraping do Mercado Livre para: ${query}`);
+    
+    const response = await axios.get(searchUrl, { 
       headers,
-      timeout: 10000 // 10 segundos timeout
+      timeout: 15000
     });
     
-    if (!response.data || !response.data.results) {
-      console.log('Resposta vazia do Mercado Livre');
-      return [];
-    }
-    
-    return response.data.results.map(item => ({
-      title: item.title,
-      price: item.price.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }),
-      store: 'Mercado Livre',
-      imageUrl: item.thumbnail ? item.thumbnail.replace('I.jpg', 'W.jpg') : '',
-      link: item.permalink
-    }));
-  } catch (error) {
-    console.error('Erro detalhado no ML:', {
-      message: error.message,
-      response: error.response?.status,
-      data: error.response?.data
-    });
-    
-    // Fallback: tentar via scraping se a API falhar
-    return await searchMercadoLivreFallback(query);
-  }
-}
-
-// Fallback via scraping caso a API oficial falhe
-async function searchMercadoLivreFallback(query) {
-  try {
-    const searchUrl = `https://lista.mercadolivre.com.br/${encodeURIComponent(query.replace(/\s+/g, '-'))}`;
-    const headers = {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
-    };
-
-    const response = await axios.get(searchUrl, { headers, timeout: 15000 });
     const $ = cheerio.load(response.data);
     const results = [];
 
-    $('.ui-search-result__wrapper').slice(0, 10).each((i, el) => {
-      const title = $(el).find('.ui-search-item__title').text().trim();
-      const price = $(el).find('.andes-money-amount__fraction').first().text().trim();
-      const imageUrl = $(el).find('.ui-search-result-image__element').attr('src') || $(el).find('.ui-search-result-image__element').attr('data-src');
-      const link = $(el).find('.ui-search-link').attr('href');
+    // Seletores atualizados para Mercado Livre
+    $('.ui-search-layout .ui-search-layout__item').slice(0, 10).each((i, el) => {
+      const $el = $(el);
+      
+      const title = $el.find('.ui-search-item__title').text().trim();
+      const priceElement = $el.find('.andes-money-amount__fraction').first();
+      const price = priceElement.text().trim();
+      
+      // Tenta pegar a imagem
+      let imageUrl = $el.find('.ui-search-result-image__element').attr('src') || 
+                    $el.find('.ui-search-result-image__element').attr('data-src') ||
+                    $el.find('img').attr('src');
+      
+      const link = $el.find('.ui-search-link').attr('href');
 
-      if (title && price) {
+      if (title && price && link) {
+        // Limpa o link para remover tracking
+        const cleanLink = link.split('?')[0];
+        
         results.push({
-          title,
+          title: title.length > 100 ? title.substring(0, 100) + '...' : title,
           price: `R$ ${price}`,
           store: 'Mercado Livre',
           imageUrl: imageUrl || '',
-          link: link || ''
+          link: cleanLink
         });
       }
     });
 
+    console.log(`Encontrados ${results.length} produtos no Mercado Livre`);
     return results;
-  } catch (fallbackError) {
-    console.error('Fallback também falhou:', fallbackError.message);
+
+  } catch (error) {
+    console.error('Erro detalhado no scraping do Mercado Livre:', {
+      message: error.message,
+      response: error.response?.status,
+      url: error.config?.url
+    });
+    
     return [];
   }
 }
