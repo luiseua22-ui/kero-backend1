@@ -32,29 +32,87 @@ const DEFAULT_USER_AGENT =
 
 // ---------------- LÓGICA DE BUSCA (NOVO) ----------------
 
-// 1. API Oficial do Mercado Livre (Garantida e Rápida)
+// 1. API Oficial do Mercado Livre (Garantida e Rápida) - VERSÃO CORRIGIDA
 async function searchMercadoLivre(query) {
   try {
     const url = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(query)}&limit=10`;
     
-    // CORREÇÃO APLICADA: Headers para simular navegador e evitar bloqueio
-    const response = await axios.get(url, {
-        headers: {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
-        }
+    // Headers mais completos para simular navegador real
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "application/json, text/plain, */*",
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Connection": "keep-alive",
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "cross-site",
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache"
+    };
+
+    const response = await axios.get(url, { 
+      headers,
+      timeout: 10000 // 10 segundos timeout
     });
+    
+    if (!response.data || !response.data.results) {
+      console.log('Resposta vazia do Mercado Livre');
+      return [];
+    }
     
     return response.data.results.map(item => ({
       title: item.title,
       price: item.price.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }),
       store: 'Mercado Livre',
-      imageUrl: item.thumbnail.replace('I.jpg', 'W.jpg'), // Tenta melhorar qualidade
+      imageUrl: item.thumbnail ? item.thumbnail.replace('I.jpg', 'W.jpg') : '',
       link: item.permalink
     }));
   } catch (error) {
-    console.error('Erro no ML:', error.message);
-    // Se der erro (bloqueio), retorna array vazio
+    console.error('Erro detalhado no ML:', {
+      message: error.message,
+      response: error.response?.status,
+      data: error.response?.data
+    });
+    
+    // Fallback: tentar via scraping se a API falhar
+    return await searchMercadoLivreFallback(query);
+  }
+}
+
+// Fallback via scraping caso a API oficial falhe
+async function searchMercadoLivreFallback(query) {
+  try {
+    const searchUrl = `https://lista.mercadolivre.com.br/${encodeURIComponent(query.replace(/\s+/g, '-'))}`;
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+    };
+
+    const response = await axios.get(searchUrl, { headers, timeout: 15000 });
+    const $ = cheerio.load(response.data);
+    const results = [];
+
+    $('.ui-search-result__wrapper').slice(0, 10).each((i, el) => {
+      const title = $(el).find('.ui-search-item__title').text().trim();
+      const price = $(el).find('.andes-money-amount__fraction').first().text().trim();
+      const imageUrl = $(el).find('.ui-search-result-image__element').attr('src') || $(el).find('.ui-search-result-image__element').attr('data-src');
+      const link = $(el).find('.ui-search-link').attr('href');
+
+      if (title && price) {
+        results.push({
+          title,
+          price: `R$ ${price}`,
+          store: 'Mercado Livre',
+          imageUrl: imageUrl || '',
+          link: link || ''
+        });
+      }
+    });
+
+    return results;
+  } catch (fallbackError) {
+    console.error('Fallback também falhou:', fallbackError.message);
     return [];
   }
 }
