@@ -1,6 +1,6 @@
 // index.js - scraper completo com nova lógica de preço e Busca Integrada (Mercado Livre + Google)
 // Versão final: Correção do bug de divisão por 100 (cent heuristic) para grandes valores.
-// UPDATE: Usando apenas scraping web para Mercado Livre devido a bloqueio da API
+// UPDATE: Seletores corrigidos para Mercado Livre
 
 import express from "express";
 import cors from "cors";
@@ -61,34 +61,104 @@ async function searchMercadoLivre(query) {
     const $ = cheerio.load(response.data);
     const results = [];
 
-    // Seletores atualizados para Mercado Livre
-    $('.ui-search-layout .ui-search-layout__item').slice(0, 10).each((i, el) => {
-      const $el = $(el);
-      
-      const title = $el.find('.ui-search-item__title').text().trim();
-      const priceElement = $el.find('.andes-money-amount__fraction').first();
-      const price = priceElement.text().trim();
-      
-      // Tenta pegar a imagem
-      let imageUrl = $el.find('.ui-search-result-image__element').attr('src') || 
-                    $el.find('.ui-search-result-image__element').attr('data-src') ||
-                    $el.find('img').attr('src');
-      
-      const link = $el.find('.ui-search-link').attr('href');
+    console.log('Página carregada, procurando produtos...');
 
-      if (title && price && link) {
-        // Limpa o link para remover tracking
-        const cleanLink = link.split('?')[0];
-        
-        results.push({
-          title: title.length > 100 ? title.substring(0, 100) + '...' : title,
-          price: `R$ ${price}`,
-          store: 'Mercado Livre',
-          imageUrl: imageUrl || '',
-          link: cleanLink
+    // MÚLTIPLOS SELETORES - Tentamos diferentes abordagens
+    const selectors = [
+        // Tentativa 1: Seletores mais genéricos
+        '.ui-search-result__wrapper',
+        '.ui-search-layout__item',
+        '.andes-card',
+        '.ui-search-result',
+        // Tentativa 2: Componentes individuais
+        '[data-component="search-result"]',
+        '.ui-search-result'
+    ];
+
+    let productsFound = 0;
+
+    for (const selector of selectors) {
+        $(selector).slice(0, 15).each((i, el) => {
+            if (productsFound >= 10) return false;
+            
+            const $el = $(el);
+            let title, price, imageUrl, link;
+
+            // Título - múltiplas tentativas
+            title = $el.find('.ui-search-item__title').text().trim() ||
+                   $el.find('.ui-search-item__group__title').text().trim() ||
+                   $el.find('h2').text().trim() ||
+                   $el.find('[data-cy="title"]').text().trim();
+
+            // Preço - múltiplas tentativas  
+            price = $el.find('.andes-money-amount__fraction').first().text().trim() ||
+                   $el.find('.price-tag-fraction').first().text().trim() ||
+                   $el.find('.ui-search-price__part').first().text().trim() ||
+                   $el.find('[data-cy="price"]').text().trim();
+
+            // Imagem - múltiplas tentativas
+            imageUrl = $el.find('.ui-search-result-image__element').attr('src') ||
+                      $el.find('img').attr('data-src') ||
+                      $el.find('img').attr('src') ||
+                      $el.find('[data-cy="image"]').attr('src');
+
+            // Link - múltiplas tentativas
+            link = $el.find('.ui-search-link').attr('href') ||
+                  $el.find('a').attr('href');
+
+            if (title && price && link) {
+                // Limpa o link para remover tracking
+                const cleanLink = link.split('?')[0];
+                
+                // Garante que o preço tenha formato correto
+                const formattedPrice = price.includes('R$') ? price : `R$ ${price.replace(/\D/g, '')}`;
+                
+                results.push({
+                  title: title.length > 100 ? title.substring(0, 100) + '...' : title,
+                  price: formattedPrice,
+                  store: 'Mercado Livre',
+                  imageUrl: imageUrl || '',
+                  link: cleanLink
+                });
+                productsFound++;
+                console.log(`Produto ${productsFound} encontrado: ${title}`);
+            }
         });
-      }
-    });
+
+        if (productsFound > 0) break; // Se encontrou com um seletor, para
+    }
+
+    // Se ainda não encontrou, tentamos uma abordagem mais agressiva
+    if (productsFound === 0) {
+        console.log('Tentando abordagem alternativa...');
+        
+        // Busca por qualquer elemento que pareça um produto
+        $('a').each((i, el) => {
+            if (productsFound >= 10) return false;
+            
+            const $el = $(el);
+            const href = $el.attr('href');
+            const text = $el.text();
+            
+            // Filtra links que são de produtos
+            if (href && href.includes('/p/') || href && href.includes('/produto/')) {
+                const title = text.trim().substring(0, 100);
+                const priceMatch = text.match(/R\$\s*(\d+[\d.,]*)/);
+                const price = priceMatch ? `R$ ${priceMatch[1]}` : 'Preço não disponível';
+                
+                if (title && price !== 'Preço não disponível') {
+                    results.push({
+                        title,
+                        price,
+                        store: 'Mercado Livre',
+                        imageUrl: '',
+                        link: href.split('?')[0]
+                    });
+                    productsFound++;
+                }
+            }
+        });
+    }
 
     console.log(`Encontrados ${results.length} produtos no Mercado Livre`);
     return results;
