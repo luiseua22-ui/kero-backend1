@@ -1,4 +1,4 @@
-// index.js - scraper completo com nova lógica de preço (prioriza JSON-LD, Selectors diretos e proximidade ao CTA)
+// index.js - scraper completo com nova lógica de preço e Busca Integrada (Mercado Livre + Google)
 // Versão final: Correção do bug de divisão por 100 (cent heuristic) para grandes valores.
 
 import express from "express";
@@ -7,6 +7,8 @@ import rateLimit from "express-rate-limit";
 import PQueue from "p-queue";
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import axios from "axios";
+import * as cheerio from "cheerio";
 
 puppeteer.use(StealthPlugin());
 
@@ -27,7 +29,76 @@ const queue = new PQueue({ concurrency: Number(process.env.SCRAPE_CONCURRENCY) |
 const DEFAULT_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ---------------- helpers ----------------
+// ---------------- LÓGICA DE BUSCA (NOVO) ----------------
+
+// 1. API Oficial do Mercado Livre (Garantida e Rápida)
+async function searchMercadoLivre(query) {
+  try {
+    const url = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(query)}&limit=10`;
+    const response = await axios.get(url);
+    
+    return response.data.results.map(item => ({
+      title: item.title,
+      price: item.price.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }),
+      store: 'Mercado Livre',
+      imageUrl: item.thumbnail.replace('I.jpg', 'W.jpg'), // Tenta melhorar qualidade
+      link: item.permalink
+    }));
+  } catch (error) {
+    console.error('Erro no ML:', error.message);
+    return [];
+  }
+}
+
+// 2. Scraping Google Shopping (Complementar)
+async function searchGoogleShopping(query) {
+  try {
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
+    };
+
+    const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&tbm=shop&hl=pt-BR&gl=br`;
+    const response = await axios.get(url, { headers });
+    
+    const $ = cheerio.load(response.data);
+    const results = [];
+
+    $('.i0X6df, .sh-dgr__content').each((i, el) => {
+      if (results.length >= 8) return; 
+
+      const title = $(el).find('h3, .tAxDx').text().trim();
+      let price = $(el).find('.a8Pemb, .aSection').first().text().trim();
+      if (!price) price = $(el).find('span[aria-hidden="true"]').first().text().trim();
+      let store = $(el).find('.aULzUe, .IuHnof').text().trim();
+      let imageUrl = $(el).find('img').attr('src');
+      let link = $(el).find('a').attr('href');
+
+      if (link && link.startsWith('/url?q=')) {
+        link = link.split('/url?q=')[1].split('&')[0];
+      } else if (link && link.startsWith('/')) {
+        link = 'https://www.google.com' + link;
+      }
+
+      if (title && price && imageUrl) {
+        results.push({
+          title,
+          price: price.includes('R$') ? price : `R$ ${price}`,
+          store: store || 'Loja Online',
+          imageUrl,
+          link
+        });
+      }
+    });
+
+    return results;
+  } catch (error) {
+    console.error('Erro no Google Scraping:', error.message);
+    return [];
+  }
+}
+
+// ---------------- helpers (ORIGINAL) ----------------
 
 function sanitizeIncomingUrl(raw) {
     if (!raw || typeof raw !== "string") return null;
@@ -700,9 +771,48 @@ app.get("/healthz", (req, res) => res.json({ ok: true }));
 app.post("/scrape", async (req, res) => {
     try {
         const url = req.body?.url || req.query?.url;
-        if (!url) return res.status(400).json({ success: false, error: "URL ausente" });
-        const result = await scrapeProduct(url);
-        res.json(result);
+        
+        // Verifica se é uma URL (Scraping direto com Puppeteer)
+        const isUrl = url && (url.startsWith('http://') || url.startsWith('https://'));
+
+        if (isUrl) {
+            console.log(`Scraping individual para: ${url}`);
+            const result = await scrapeProduct(url);
+            res.json(result);
+        } else {
+            // Se NÃO for URL, assume que é uma BUSCA (Google Shopping + ML)
+            console.log(`Realizando busca para: ${url}`);
+            
+            if (!url || url.trim().length < 2) {
+                return res.json([]);
+            }
+
+            const [mlResults, googleResults] = await Promise.all([
+                searchMercadoLivre(url),
+                searchGoogleShopping(url)
+            ]);
+
+            // Intercala os resultados
+            const combined = [];
+            const maxLength = Math.max(mlResults.length, googleResults.length);
+            
+            for (let i = 0; i < maxLength; i++) {
+                if (mlResults[i]) combined.push(mlResults[i]);
+                if (googleResults[i]) combined.push(googleResults[i]);
+            }
+
+            // O Frontend espera um array direto ou um objeto?
+            // O frontend (api.ts) na função searchProducts espera um ARRAY.
+            // O endpoint /scrape original retornava um objeto { success: true }.
+            // Se o frontend mandar o termo de busca para este endpoint, ele vai receber um array.
+            
+            // ATENÇÃO: O código do frontend atual trata a resposta com await resp.text() e JSON.parse.
+            // Se o resultado for um array, o parse vai funcionar.
+            
+            // Retorna o array de produtos diretamente se for busca
+            res.json(combined);
+        }
+
     } catch (e) {
         console.error("ROUTE ERROR:", e && e.message);
         res.status(500).json({ success: false, error: String(e) });
