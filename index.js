@@ -1,6 +1,5 @@
-// index.js - scraper completo com nova lógica de preço e Busca Integrada (Mercado Livre + Google)
-// Versão final: Correção do bug de divisão por 100 (cent heuristic) para grandes valores.
-// UPDATE: Seletores corrigidos para Mercado Livre
+// index.js - scraper completo com nova lógica de preço e Busca Integrada Multi-Fonte
+// Versão final: Mantém todas as funções originais, apenas substitui a busca por multi-fonte
 
 import express from "express";
 import cors from "cors";
@@ -24,205 +23,197 @@ app.use(express.json({ limit: "2mb" }));
 const limiter = rateLimit({ windowMs: 10 * 1000, max: 30 });
 app.use(limiter);
 
-// CORREÇÃO DE NOME DE VAR: Manter SCRAPE_CONCURRENCY, mas notar que no render.yaml o nome pode estar errado.
 const queue = new PQueue({ concurrency: Number(process.env.SCRAPE_CONCURRENCY) || 2 });
 
 const DEFAULT_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ---------------- LÓGICA DE BUSCA (NOVO) ----------------
+// ---------------- NOVA LÓGICA DE BUSCA MULTI-FONTE ----------------
 
-// 1. SCRAPING Mercado Livre (Alternativa devido a bloqueio da API)
-async function searchMercadoLivre(query) {
+// 1. BuscaPé - Agregador confiável
+async function searchBuscape(query) {
   try {
-    const searchUrl = `https://lista.mercadolivre.com.br/${encodeURIComponent(query.replace(/\s+/g, '-'))}`;
+    const searchUrl = `https://www.buscape.com.br/search?q=${encodeURIComponent(query)}`;
     
     const headers = {
       "User-Agent": DEFAULT_USER_AGENT,
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
       "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Accept-Encoding": "gzip, deflate, br",
-      "Connection": "keep-alive",
-      "Sec-Fetch-Dest": "document",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Site": "none",
-      "Cache-Control": "no-cache",
-      "Pragma": "no-cache",
-      "Upgrade-Insecure-Requests": "1"
     };
 
-    console.log(`Fazendo scraping do Mercado Livre para: ${query}`);
-    
     const response = await axios.get(searchUrl, { 
       headers,
-      timeout: 15000
+      timeout: 10000
     });
     
     const $ = cheerio.load(response.data);
     const results = [];
 
-    console.log('Página carregada, procurando produtos...');
+    $('[data-testid="product-card"]').slice(0, 6).each((i, el) => {
+      const $el = $(el);
+      
+      const title = $el.find('[data-testid="product-card::name"]').text().trim();
+      const price = $el.find('[data-testid="product-card::price"]').text().trim();
+      const imageUrl = $el.find('img').attr('src');
+      const link = $el.find('a').attr('href');
 
-    // MÚLTIPLOS SELETORES - Tentamos diferentes abordagens
-    const selectors = [
-        // Tentativa 1: Seletores mais genéricos
-        '.ui-search-result__wrapper',
-        '.ui-search-layout__item',
-        '.andes-card',
-        '.ui-search-result',
-        // Tentativa 2: Componentes individuais
-        '[data-component="search-result"]',
-        '.ui-search-result'
-    ];
-
-    let productsFound = 0;
-
-    for (const selector of selectors) {
-        $(selector).slice(0, 15).each((i, el) => {
-            if (productsFound >= 10) return false;
-            
-            const $el = $(el);
-            let title, price, imageUrl, link;
-
-            // Título - múltiplas tentativas
-            title = $el.find('.ui-search-item__title').text().trim() ||
-                   $el.find('.ui-search-item__group__title').text().trim() ||
-                   $el.find('h2').text().trim() ||
-                   $el.find('[data-cy="title"]').text().trim();
-
-            // Preço - múltiplas tentativas  
-            price = $el.find('.andes-money-amount__fraction').first().text().trim() ||
-                   $el.find('.price-tag-fraction').first().text().trim() ||
-                   $el.find('.ui-search-price__part').first().text().trim() ||
-                   $el.find('[data-cy="price"]').text().trim();
-
-            // Imagem - múltiplas tentativas
-            imageUrl = $el.find('.ui-search-result-image__element').attr('src') ||
-                      $el.find('img').attr('data-src') ||
-                      $el.find('img').attr('src') ||
-                      $el.find('[data-cy="image"]').attr('src');
-
-            // Link - múltiplas tentativas
-            link = $el.find('.ui-search-link').attr('href') ||
-                  $el.find('a').attr('href');
-
-            if (title && price && link) {
-                // Limpa o link para remover tracking
-                const cleanLink = link.split('?')[0];
-                
-                // Garante que o preço tenha formato correto
-                const formattedPrice = price.includes('R$') ? price : `R$ ${price.replace(/\D/g, '')}`;
-                
-                results.push({
-                  title: title.length > 100 ? title.substring(0, 100) + '...' : title,
-                  price: formattedPrice,
-                  store: 'Mercado Livre',
-                  imageUrl: imageUrl || '',
-                  link: cleanLink
-                });
-                productsFound++;
-                console.log(`Produto ${productsFound} encontrado: ${title}`);
-            }
+      if (title && price) {
+        const fullLink = link ? `https://www.buscape.com.br${link}` : '';
+        results.push({
+          title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+          price: price.includes('R$') ? price : `R$ ${price}`,
+          store: 'BuscaPé',
+          imageUrl: imageUrl || '',
+          link: fullLink
         });
+      }
+    });
 
-        if (productsFound > 0) break; // Se encontrou com um seletor, para
-    }
-
-    // Se ainda não encontrou, tentamos uma abordagem mais agressiva
-    if (productsFound === 0) {
-        console.log('Tentando abordagem alternativa...');
-        
-        // Busca por qualquer elemento que pareça um produto
-        $('a').each((i, el) => {
-            if (productsFound >= 10) return false;
-            
-            const $el = $(el);
-            const href = $el.attr('href');
-            const text = $el.text();
-            
-            // Filtra links que são de produtos
-            if (href && href.includes('/p/') || href && href.includes('/produto/')) {
-                const title = text.trim().substring(0, 100);
-                const priceMatch = text.match(/R\$\s*(\d+[\d.,]*)/);
-                const price = priceMatch ? `R$ ${priceMatch[1]}` : 'Preço não disponível';
-                
-                if (title && price !== 'Preço não disponível') {
-                    results.push({
-                        title,
-                        price,
-                        store: 'Mercado Livre',
-                        imageUrl: '',
-                        link: href.split('?')[0]
-                    });
-                    productsFound++;
-                }
-            }
-        });
-    }
-
-    console.log(`Encontrados ${results.length} produtos no Mercado Livre`);
     return results;
 
   } catch (error) {
-    console.error('Erro detalhado no scraping do Mercado Livre:', {
-      message: error.message,
-      response: error.response?.status,
-      url: error.config?.url
-    });
-    
+    console.log('BuscaPé não disponível:', error.message);
     return [];
   }
 }
 
-// 2. Scraping Google Shopping (Complementar)
-async function searchGoogleShopping(query) {
+// 2. Magazine Luiza - Menos restritivo
+async function searchMagazineLuiza(query) {
   try {
+    const searchUrl = `https://www.magazineluiza.com.br/busca/${encodeURIComponent(query.replace(/\s+/g, '+'))}/`;
+    
     const headers = {
-      'User-Agent': DEFAULT_USER_AGENT,
-      'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
+      "User-Agent": DEFAULT_USER_AGENT,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     };
 
-    const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&tbm=shop&hl=pt-BR&gl=br`;
-    const response = await axios.get(url, { headers });
+    const response = await axios.get(searchUrl, { 
+      headers,
+      timeout: 10000
+    });
     
     const $ = cheerio.load(response.data);
     const results = [];
 
-    $('.i0X6df, .sh-dgr__content').each((i, el) => {
-      if (results.length >= 8) return; 
+    $('[data-testid="product-card"]').slice(0, 6).each((i, el) => {
+      const $el = $(el);
+      
+      const title = $el.find('[data-testid="product-title"]').text().trim();
+      const price = $el.find('[data-testid="price-value"]').text().trim();
+      const imageUrl = $el.find('img').attr('src');
+      const link = $el.find('a').attr('href');
 
-      const title = $(el).find('h3, .tAxDx').text().trim();
-      let price = $(el).find('.a8Pemb, .aSection').first().text().trim();
-      if (!price) price = $(el).find('span[aria-hidden="true"]').first().text().trim();
-      let store = $(el).find('.aULzUe, .IuHnof').text().trim();
-      let imageUrl = $(el).find('img').attr('src');
-      let link = $(el).find('a').attr('href');
-
-      if (link && link.startsWith('/url?q=')) {
-        link = link.split('/url?q=')[1].split('&')[0];
-      } else if (link && link.startsWith('/')) {
-        link = 'https://www.google.com' + link;
-      }
-
-      if (title && price && imageUrl) {
+      if (title && price) {
+        const fullLink = link ? `https://www.magazineluiza.com.br${link}` : '';
         results.push({
-          title,
+          title: title.length > 80 ? title.substring(0, 80) + '...' : title,
           price: price.includes('R$') ? price : `R$ ${price}`,
-          store: store || 'Loja Online',
-          imageUrl,
-          link
+          store: 'Magazine Luiza',
+          imageUrl: imageUrl || '',
+          link: fullLink
         });
       }
     });
 
     return results;
+
   } catch (error) {
-    console.error('Erro no Google Scraping:', error.message);
+    console.log('Magazine Luiza não disponível:', error.message);
     return [];
   }
 }
 
-// ---------------- helpers (ORIGINAL) ----------------
+// 3. Americanas - Backup
+async function searchAmericanas(query) {
+  try {
+    const searchUrl = `https://www.americanas.com.br/busca/${encodeURIComponent(query.replace(/\s+/g, '+'))}`;
+    
+    const headers = {
+      "User-Agent": DEFAULT_USER_AGENT,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    };
+
+    const response = await axios.get(searchUrl, { 
+      headers,
+      timeout: 10000
+    });
+    
+    const $ = cheerio.load(response.data);
+    const results = [];
+
+    $('[class*="product-grid__Item"]').slice(0, 6).each((i, el) => {
+      const $el = $(el);
+      
+      const title = $el.find('h3').text().trim() || $el.find('[class*="product-name"]').text().trim();
+      const price = $el.find('[class*="price"]').first().text().trim();
+      const imageUrl = $el.find('img').attr('src');
+      const link = $el.find('a').attr('href');
+
+      if (title && price && price.length < 20) {
+        const fullLink = link ? `https://www.americanas.com.br${link}` : '';
+        results.push({
+          title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+          price: price.includes('R$') ? price : `R$ ${price}`,
+          store: 'Americanas',
+          imageUrl: imageUrl || '',
+          link: fullLink
+        });
+      }
+    });
+
+    return results;
+
+  } catch (error) {
+    console.log('Americanas não disponível:', error.message);
+    return [];
+  }
+}
+
+// Função principal de busca multi-fonte
+async function searchProductsMultiSource(query) {
+  console.log(`🔍 Buscando em múltiplas fontes: "${query}"`);
+  
+  const searchPromises = [
+    searchBuscape(query),
+    searchMagazineLuiza(query),
+    searchAmericanas(query)
+  ];
+
+  try {
+    const results = await Promise.allSettled(searchPromises);
+    
+    const allProducts = [];
+    
+    results.forEach((result) => {
+      if (result.status === 'fulfilled' && result.value.length > 0) {
+        allProducts.push(...result.value);
+      }
+    });
+
+    // Remove duplicatas
+    const uniqueProducts = [];
+    const seenTitles = new Set();
+    
+    allProducts.forEach(product => {
+      const simpleTitle = product.title.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 40);
+      if (!seenTitles.has(simpleTitle)) {
+        seenTitles.add(simpleTitle);
+        uniqueProducts.push(product);
+      }
+    });
+
+    console.log(`✅ Encontrados ${uniqueProducts.length} produtos únicos`);
+    return uniqueProducts.slice(0, 15);
+
+  } catch (error) {
+    console.error('Erro na busca multi-fonte:', error);
+    return [];
+  }
+}
+
+// ---------------- FUNÇÕES ORIGINAIS MANTIDAS INTACTAS ----------------
 
 function sanitizeIncomingUrl(raw) {
     if (!raw || typeof raw !== "string") return null;
@@ -904,28 +895,15 @@ app.post("/scrape", async (req, res) => {
             const result = await scrapeProduct(url);
             res.json(result);
         } else {
-            // Se NÃO for URL, assume que é uma BUSCA (Google Shopping + ML)
-            console.log(`Realizando busca para: ${url}`);
+            // Se NÃO for URL, assume que é uma BUSCA (Multi-fonte)
+            console.log(`Realizando busca multi-fonte para: ${url}`);
             
             if (!url || url.trim().length < 2) {
                 return res.json([]);
             }
 
-            const [mlResults, googleResults] = await Promise.all([
-                searchMercadoLivre(url),
-                searchGoogleShopping(url)
-            ]);
-
-            // Intercala os resultados
-            const combined = [];
-            const maxLength = Math.max(mlResults.length, googleResults.length);
-            
-            for (let i = 0; i < maxLength; i++) {
-                if (mlResults[i]) combined.push(mlResults[i]);
-                if (googleResults[i]) combined.push(googleResults[i]);
-            }
-            
-            res.json(combined);
+            const products = await searchProductsMultiSource(url);
+            res.json(products);
         }
 
     } catch (e) {
@@ -935,4 +913,4 @@ app.post("/scrape", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT} - Modo Multi-Fonte`));
