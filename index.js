@@ -28,12 +28,12 @@ const queue = new PQueue({ concurrency: Number(process.env.SCRAPE_CONCURRENCY) |
 const DEFAULT_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ---------------- NOVA LÓGICA DE BUSCA MULTI-FONTE ----------------
+// ---------------- NOVA LÓGICA DE BUSCA MULTI-FONTE MELHORADA ----------------
 
-// 1. BuscaPé - Agregador confiável
-async function searchBuscape(query) {
+// 1. Amazon - Para produtos diversificados
+async function searchAmazon(query) {
   try {
-    const searchUrl = `https://www.buscape.com.br/search?q=${encodeURIComponent(query)}`;
+    const searchUrl = `https://www.amazon.com.br/s?k=${encodeURIComponent(query.replace(/\s+/g, '+'))}`;
     
     const headers = {
       "User-Agent": DEFAULT_USER_AGENT,
@@ -41,43 +41,113 @@ async function searchBuscape(query) {
       "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     };
 
+    console.log(`Buscando na Amazon: ${query}`);
+    
     const response = await axios.get(searchUrl, { 
       headers,
-      timeout: 10000
+      timeout: 15000
     });
     
     const $ = cheerio.load(response.data);
     const results = [];
 
-    $('[data-testid="product-card"]').slice(0, 6).each((i, el) => {
+    // Múltiplos seletores para Amazon
+    $('.s-result-item, [data-component-type="s-search-result"]').slice(0, 8).each((i, el) => {
       const $el = $(el);
       
-      const title = $el.find('[data-testid="product-card::name"]').text().trim();
-      const price = $el.find('[data-testid="product-card::price"]').text().trim();
-      const imageUrl = $el.find('img').attr('src');
-      const link = $el.find('a').attr('href');
+      const title = $el.find('h2 a span').text().trim() || 
+                   $el.find('.a-size-medium').text().trim();
+      
+      const price = $el.find('.a-price-whole').first().text().trim() ||
+                   $el.find('.a-price .a-offscreen').text().trim();
+      
+      const imageUrl = $el.find('.s-image').attr('src') ||
+                      $el.find('img').attr('src');
+      
+      let link = $el.find('a').attr('href');
 
-      if (title && price) {
-        const fullLink = link ? `https://www.buscape.com.br${link}` : '';
+      if (title && price && link) {
+        const fullLink = link.startsWith('/') ? `https://www.amazon.com.br${link}` : link;
+        const cleanLink = fullLink.split('?')[0];
+        
         results.push({
           title: title.length > 80 ? title.substring(0, 80) + '...' : title,
-          price: price.includes('R$') ? price : `R$ ${price}`,
-          store: 'BuscaPé',
+          price: price.includes('R$') ? price : `R$ ${price.replace(/\D/g, '')}`,
+          store: 'Amazon',
           imageUrl: imageUrl || '',
-          link: fullLink
+          link: cleanLink
         });
       }
     });
 
+    console.log(`✅ Amazon: ${results.length} produtos`);
     return results;
 
   } catch (error) {
-    console.log('BuscaPé não disponível:', error.message);
+    console.log('❌ Amazon não disponível:', error.message);
     return [];
   }
 }
 
-// 2. Magazine Luiza - Menos restritivo
+// 2. Mercado Livre (tentativa com headers diferentes)
+async function searchMercadoLivre(query) {
+  try {
+    const searchUrl = `https://lista.mercadolivre.com.br/${encodeURIComponent(query.replace(/\s+/g, '-'))}`;
+    
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    };
+
+    console.log(`Tentando Mercado Livre: ${query}`);
+    
+    const response = await axios.get(searchUrl, { 
+      headers,
+      timeout: 15000
+    });
+    
+    const $ = cheerio.load(response.data);
+    const results = [];
+
+    // Seletores mais genéricos para ML
+    $('.ui-search-layout__item, .andes-card').slice(0, 6).each((i, el) => {
+      const $el = $(el);
+      
+      const title = $el.find('.ui-search-item__title').text().trim() ||
+                   $el.find('h2').text().trim();
+      
+      const price = $el.find('.andes-money-amount__fraction').first().text().trim() ||
+                   $el.find('.price-tag-fraction').text().trim();
+      
+      const imageUrl = $el.find('img').attr('data-src') ||
+                      $el.find('img').attr('src');
+      
+      let link = $el.find('a').attr('href');
+
+      if (title && price && link) {
+        const cleanLink = link.split('?')[0];
+        
+        results.push({
+          title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+          price: `R$ ${price.replace(/\D/g, '')}`,
+          store: 'Mercado Livre',
+          imageUrl: imageUrl || '',
+          link: cleanLink
+        });
+      }
+    });
+
+    console.log(`✅ Mercado Livre: ${results.length} produtos`);
+    return results;
+
+  } catch (error) {
+    console.log('❌ Mercado Livre não disponível:', error.message);
+    return [];
+  }
+}
+
+// 3. Magazine Luiza - Para produtos nacionais
 async function searchMagazineLuiza(query) {
   try {
     const searchUrl = `https://www.magazineluiza.com.br/busca/${encodeURIComponent(query.replace(/\s+/g, '+'))}/`;
@@ -85,9 +155,10 @@ async function searchMagazineLuiza(query) {
     const headers = {
       "User-Agent": DEFAULT_USER_AGENT,
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     };
 
+    console.log(`Buscando Magazine Luiza: ${query}`);
+    
     const response = await axios.get(searchUrl, { 
       headers,
       timeout: 10000
@@ -116,18 +187,19 @@ async function searchMagazineLuiza(query) {
       }
     });
 
+    console.log(`✅ Magazine Luiza: ${results.length} produtos`);
     return results;
 
   } catch (error) {
-    console.log('Magazine Luiza não disponível:', error.message);
+    console.log('❌ Magazine Luiza não disponível:', error.message);
     return [];
   }
 }
 
-// 3. Americanas - Backup
-async function searchAmericanas(query) {
+// 4. AliExpress - Para produtos internacionais
+async function searchAliExpress(query) {
   try {
-    const searchUrl = `https://www.americanas.com.br/busca/${encodeURIComponent(query.replace(/\s+/g, '+'))}`;
+    const searchUrl = `https://pt.aliexpress.com/wholesale?SearchText=${encodeURIComponent(query.replace(/\s+/g, '+'))}`;
     
     const headers = {
       "User-Agent": DEFAULT_USER_AGENT,
@@ -135,6 +207,65 @@ async function searchAmericanas(query) {
       "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     };
 
+    console.log(`Buscando AliExpress: ${query}`);
+    
+    const response = await axios.get(searchUrl, { 
+      headers,
+      timeout: 15000
+    });
+    
+    const $ = cheerio.load(response.data);
+    const results = [];
+
+    $('[data-product-id]').slice(0, 6).each((i, el) => {
+      const $el = $(el);
+      
+      const title = $el.find('.item-title').text().trim() ||
+                   $el.find('h3').text().trim();
+      
+      const price = $el.find('.price-current').text().trim() ||
+                   $el.find('.value').text().trim();
+      
+      const imageUrl = $el.find('img').attr('src') ||
+                      $el.find('img').attr('image-src');
+      
+      let link = $el.find('a').attr('href');
+
+      if (title && price && link) {
+        const fullLink = link.startsWith('//') ? `https:${link}` : 
+                        link.startsWith('/') ? `https://pt.aliexpress.com${link}` : link;
+        
+        results.push({
+          title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+          price: price.includes('R$') ? price : `R$ ${price.replace(/\D/g, '')}`,
+          store: 'AliExpress',
+          imageUrl: imageUrl || '',
+          link: fullLink
+        });
+      }
+    });
+
+    console.log(`✅ AliExpress: ${results.length} produtos`);
+    return results;
+
+  } catch (error) {
+    console.log('❌ AliExpress não disponível:', error.message);
+    return [];
+  }
+}
+
+// 5. Americanas - Backup nacional
+async function searchAmericanas(query) {
+  try {
+    const searchUrl = `https://www.americanas.com.br/busca/${encodeURIComponent(query.replace(/\s+/g, '+'))}`;
+    
+    const headers = {
+      "User-Agent": DEFAULT_USER_AGENT,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    };
+
+    console.log(`Buscando Americanas: ${query}`);
+    
     const response = await axios.get(searchUrl, { 
       headers,
       timeout: 10000
@@ -143,10 +274,12 @@ async function searchAmericanas(query) {
     const $ = cheerio.load(response.data);
     const results = [];
 
-    $('[class*="product-grid__Item"]').slice(0, 6).each((i, el) => {
+    $('[class*="product-grid__Item"]').slice(0, 4).each((i, el) => {
       const $el = $(el);
       
-      const title = $el.find('h3').text().trim() || $el.find('[class*="product-name"]').text().trim();
+      const title = $el.find('h3').text().trim() || 
+                   $el.find('[class*="product-name"]').text().trim();
+      
       const price = $el.find('[class*="price"]').first().text().trim();
       const imageUrl = $el.find('img').attr('src');
       const link = $el.find('a').attr('href');
@@ -163,52 +296,89 @@ async function searchAmericanas(query) {
       }
     });
 
+    console.log(`✅ Americanas: ${results.length} produtos`);
     return results;
 
   } catch (error) {
-    console.log('Americanas não disponível:', error.message);
+    console.log('❌ Americanas não disponível:', error.message);
     return [];
   }
 }
 
-// Função principal de busca multi-fonte
+// Função principal de busca multi-fonte inteligente
 async function searchProductsMultiSource(query) {
-  console.log(`🔍 Buscando em múltiplas fontes: "${query}"`);
+  console.log(`\n🔍 INICIANDO BUSCA INTELIGENTE: "${query}"`);
   
-  const searchPromises = [
-    searchBuscape(query),
+  // Executa buscas prioritárias primeiro
+  const prioritySearches = [
+    searchAmazon(query),
+    searchMercadoLivre(query),
+    searchAliExpress(query)
+  ];
+
+  const backupSearches = [
     searchMagazineLuiza(query),
     searchAmericanas(query)
   ];
 
   try {
-    const results = await Promise.allSettled(searchPromises);
+    // Primeiro: tenta fontes prioritárias
+    const priorityResults = await Promise.allSettled(prioritySearches);
     
-    const allProducts = [];
-    
-    results.forEach((result) => {
+    let allProducts = [];
+    let totalFound = 0;
+
+    priorityResults.forEach((result, index) => {
+      const sources = ['Amazon', 'Mercado Livre', 'AliExpress'];
       if (result.status === 'fulfilled' && result.value.length > 0) {
         allProducts.push(...result.value);
+        totalFound += result.value.length;
       }
     });
 
-    // Remove duplicatas
+    // Se não encontrou produtos suficientes, tenta fontes de backup
+    if (totalFound < 5) {
+      console.log(`⚡ Poucos resultados (${totalFound}), acionando backup...`);
+      
+      const backupResults = await Promise.allSettled(backupSearches);
+      
+      backupResults.forEach((result, index) => {
+        const sources = ['Magazine Luiza', 'Americanas'];
+        if (result.status === 'fulfilled' && result.value.length > 0) {
+          allProducts.push(...result.value);
+          totalFound += result.value.length;
+        }
+      });
+    }
+
+    // Remove duplicatas inteligente
     const uniqueProducts = [];
     const seenTitles = new Set();
     
     allProducts.forEach(product => {
-      const simpleTitle = product.title.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 40);
-      if (!seenTitles.has(simpleTitle)) {
-        seenTitles.add(simpleTitle);
+      // Normaliza o título para comparação
+      const normalizedTitle = product.title
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '')
+        .substring(0, 50);
+      
+      if (!seenTitles.has(normalizedTitle)) {
+        seenTitles.add(normalizedTitle);
         uniqueProducts.push(product);
       }
     });
 
-    console.log(`✅ Encontrados ${uniqueProducts.length} produtos únicos`);
-    return uniqueProducts.slice(0, 15);
+    // Ordena por relevância (Amazon primeiro, depois outras)
+    uniqueProducts.sort((a, b) => {
+      const storePriority = { 'Amazon': 1, 'AliExpress': 2, 'Mercado Livre': 3, 'Magazine Luiza': 4, 'Americanas': 5 };
+      return (storePriority[a.store] || 6) - (storePriority[b.store] || 6);
+    });
+
+    console.log(`🎯 BUSCA FINALIZADA: ${uniqueProducts.length} produtos relevantes`);
+    return uniqueProducts.slice(0, 20);
 
   } catch (error) {
-    console.error('Erro na busca multi-fonte:', error);
+    console.error('❌ Erro na busca multi-fonte:', error);
     return [];
   }
 }
@@ -913,4 +1083,9 @@ app.post("/scrape", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT} - Modo Multi-Fonte`));
+app.listen(PORT, () => {
+  console.log(`\n🎯 Backend rodando na porta ${PORT}`);
+  console.log(`📡 Modo: Busca Inteligente Multi-Fonte`);
+  console.log(`⭐ Fontes: Amazon, Mercado Livre, AliExpress, Magazine Luiza, Americanas`);
+  console.log(`⚡ Concorrência: ${Number(process.env.SCRAPE_CONCURRENCY) || 2} requests\n`);
+});
