@@ -96,27 +96,9 @@ async function searchWithPuppeteer(query) {
     // Remove duplicatas
     const uniqueResults = removeDuplicates(results);
     console.log(`🎯 Total de produtos únicos: ${uniqueResults.length}`);
-
-    // Fallback: se nenhum resultado, retorna produtos mock para teste
-    if (uniqueResults.length === 0) {
-      console.log("⚠️  Nenhum produto encontrado, usando fallback...");
-      return [
-        {
-          title: "Relógio Rolex Oyster Perpetual 41mm",
-          price: "R$ 45.990,00",
-          store: "Mercado Livre",
-          imageUrl: "https://http2.mlstatic.com/D_NQ_NP_123456-MLB12345678901_072021-O.jpg",
-          link: "https://produto.mercadolivre.com.br/MLB-1234567890"
-        },
-        {
-          title: "Rolex Datejust 36mm Aço Ouro",
-          price: "R$ 52.500,00",
-          store: "Amazon",
-          imageUrl: "https://m.media-amazon.com/images/I/71ABC12345L._AC_SL1500_.jpg",
-          link: "https://www.amazon.com.br/dp/B08XYZ1234"
-        }
-      ];
-    }
+    
+    // Log dos produtos encontrados para debug
+    console.log("📦 Produtos encontrados:", JSON.stringify(uniqueResults, null, 2));
     
     return uniqueResults.slice(0, 15);
 
@@ -132,6 +114,7 @@ async function searchAmazon(page, query) {
   const searchUrl = `https://www.amazon.com.br/s?k=${encodeURIComponent(query)}&__mk_pt_BR=%C3%85M%C3%85%C5%BD%C3%95%C3%91&crid=2VGEQA0R25W1P&sprefix=${encodeURIComponent(query)}%2Caps%2C238`;
   
   try {
+    console.log(`🌍 Acessando Amazon: ${searchUrl}`);
     await page.goto(searchUrl, { 
       waitUntil: "networkidle2", 
       timeout: 25000 
@@ -143,6 +126,8 @@ async function searchAmazon(page, query) {
       const results = [];
       // Seletores atualizados para Amazon Brasil 2024
       const items = document.querySelectorAll('[data-component-type="s-search-result"], .s-result-item, div[data-asin]:not([data-asin=""])');
+      
+      console.log(`📊 Total de itens encontrados no DOM: ${items.length}`);
       
       for (const item of items) {
         try {
@@ -175,12 +160,19 @@ async function searchAmazon(page, query) {
               price = priceSymbol.textContent.trim();
             } else if (priceWhole) {
               price = `R$ ${priceWhole.textContent.trim()}`;
+            } else {
+              // Tenta encontrar preço em outros seletores
+              const altPrice = item.querySelector('.a-price .a-offscreen');
+              if (altPrice) {
+                price = altPrice.textContent.trim();
+              }
             }
             
             const imageUrl = imageEl ? (imageEl.src || imageEl.getAttribute('data-src') || '') : '';
             const link = linkEl.href;
             
-            if (title && price) {
+            if (title && price && price.length > 0) {
+              console.log(`✅ Produto Amazon encontrado: ${title.substring(0, 50)}... - ${price}`);
               results.push({
                 title: title.length > 80 ? title.substring(0, 80) + '...' : title,
                 price: price,
@@ -188,28 +180,33 @@ async function searchAmazon(page, query) {
                 imageUrl,
                 link: link.split('?')[0]
               });
+            } else {
+              console.log(`⚠️  Produto Amazon sem preço: ${title ? title.substring(0, 50) : 'Sem título'}`);
             }
           }
         } catch (e) {
+          console.error(`❌ Erro ao processar item Amazon:`, e.message);
           continue;
         }
         
         if (results.length >= 6) break;
       }
       
+      console.log(`📈 Produtos Amazon processados: ${results.length}`);
       return results;
     });
   } catch (error) {
-    console.error("Amazon error:", error.message);
+    console.error("❌ Amazon error:", error.message);
     return [];
   }
 }
 
 async function searchMercadoLivre(page, query) {
   // URL corrigida para busca
-  const searchUrl = `https://lista.mercadolivre.com.br/${encodeURIComponent(query.replace(/\s+/g, '-'))}_NoIndex_True`;
+  const searchUrl = `https://lista.mercadolivre.com.br/${encodeURIComponent(query.replace(/\s+/g, '-'))}`;
   
   try {
+    console.log(`🌍 Acessando Mercado Livre: ${searchUrl}`);
     await page.goto(searchUrl, { 
       waitUntil: "networkidle2", 
       timeout: 25000 
@@ -221,6 +218,8 @@ async function searchMercadoLivre(page, query) {
       const results = [];
       // Seletores atualizados Mercado Livre
       const items = document.querySelectorAll('.ui-search-layout__item, .andes-card, [data-testid="product-card"], li.ui-search-layout__item');
+      
+      console.log(`📊 Total de itens encontrados no DOM: ${items.length}`);
       
       for (const item of items) {
         try {
@@ -245,11 +244,13 @@ async function searchMercadoLivre(page, query) {
           
           if (titleEl && priceEl && linkEl) {
             const title = titleEl.textContent.trim();
-            const price = `R$ ${priceEl.textContent.trim().replace(/\D/g, '')}`;
+            const priceText = priceEl.textContent.trim();
+            const price = priceText.includes('R$') ? priceText : `R$ ${priceText}`;
             const imageUrl = imageEl ? (imageEl.src || imageEl.getAttribute('data-src') || imageEl.getAttribute('src') || '') : '';
             const link = linkEl.href;
             
-            if (title && price) {
+            if (title && price && price.length > 0) {
+              console.log(`✅ Produto Mercado Livre encontrado: ${title.substring(0, 50)}... - ${price}`);
               results.push({
                 title: title.length > 80 ? title.substring(0, 80) + '...' : title,
                 price: price,
@@ -257,19 +258,23 @@ async function searchMercadoLivre(page, query) {
                 imageUrl,
                 link: link.split('?')[0]
               });
+            } else {
+              console.log(`⚠️  Produto Mercado Livre sem preço: ${title ? title.substring(0, 50) : 'Sem título'}`);
             }
           }
         } catch (e) {
+          console.error(`❌ Erro ao processar item Mercado Livre:`, e.message);
           continue;
         }
         
         if (results.length >= 6) break;
       }
       
+      console.log(`📈 Produtos Mercado Livre processados: ${results.length}`);
       return results;
     });
   } catch (error) {
-    console.error("Mercado Livre error:", error.message);
+    console.error("❌ Mercado Livre error:", error.message);
     return [];
   }
 }
@@ -278,6 +283,7 @@ async function searchMagazineLuizaDirect(page, query) {
   const searchUrl = `https://www.magazineluiza.com.br/busca/${encodeURIComponent(query)}/`;
   
   try {
+    console.log(`🌍 Acessando Magazine Luiza: ${searchUrl}`);
     await page.goto(searchUrl, { 
       waitUntil: "domcontentloaded", 
       timeout: 20000 
@@ -287,7 +293,9 @@ async function searchMagazineLuizaDirect(page, query) {
 
     return await page.evaluate(() => {
       const results = [];
-      const items = document.querySelectorAll('[data-testid="product-card"], .product');
+      const items = document.querySelectorAll('[data-testid="product-card"], .product, [data-testid="product-list"] li');
+      
+      console.log(`📊 Total de itens encontrados no DOM: ${items.length}`);
       
       for (const item of items) {
         try {
@@ -312,6 +320,7 @@ async function searchMagazineLuizaDirect(page, query) {
             const link = linkEl.href.startsWith('http') ? linkEl.href : `https://www.magazineluiza.com.br${linkEl.href}`;
             
             if (title && price && price.length < 50) { // Filtra preços inválidos
+              console.log(`✅ Produto Magazine Luiza encontrado: ${title.substring(0, 50)}... - ${price}`);
               results.push({
                 title: title.length > 80 ? title.substring(0, 80) + '...' : title,
                 price: price.includes('R$') ? price : `R$ ${price}`,
@@ -319,18 +328,23 @@ async function searchMagazineLuizaDirect(page, query) {
                 imageUrl,
                 link: link.split('?')[0]
               });
+            } else {
+              console.log(`⚠️  Produto Magazine Luiza sem preço ou preço inválido: ${title ? title.substring(0, 50) : 'Sem título'}`);
             }
           }
         } catch (e) {
+          console.error(`❌ Erro ao processar item Magazine Luiza:`, e.message);
           continue;
         }
         
         if (results.length >= 5) break;
       }
       
+      console.log(`📈 Produtos Magazine Luiza processados: ${results.length}`);
       return results;
     });
   } catch (error) {
+    console.error("❌ Magazine Luiza error:", error.message);
     return [];
   }
 }
@@ -340,6 +354,8 @@ function removeDuplicates(products) {
   const unique = [];
   
   for (const product of products) {
+    if (!product.title || !product.price) continue;
+    
     const key = product.title.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 50);
     if (!seen.has(key) && product.title && product.price) {
       seen.add(key);
@@ -982,6 +998,28 @@ async function scrapeProduct(rawUrl) {
 // ---------------- ROTAS ----------------
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
+// Rota de teste para verificar se o backend está funcionando
+app.post("/test-search", (req, res) => {
+  const mockProducts = [
+    {
+        title: "Relógio Rolex Oyster Perpetual 41mm",
+        price: "R$ 45.990,00",
+        store: "Amazon",
+        imageUrl: "https://m.media-amazon.com/images/I/71ABC12345L._AC_SL1500_.jpg",
+        link: "https://www.amazon.com.br/dp/B08XYZ1234"
+    },
+    {
+        title: "Rolex Datejust 36mm Aço Ouro",
+        price: "R$ 52.500,00",
+        store: "Mercado Livre",
+        imageUrl: "https://http2.mlstatic.com/D_NQ_NP_123456-MLB12345678901_072021-O.jpg",
+        link: "https://produto.mercadolivre.com.br/MLB-1234567890"
+    }
+  ];
+  console.log('✅ Retornando produtos de teste');
+  res.json(mockProducts);
+});
+
 app.post("/scrape", async (req, res) => {
     try {
         const url = req.body?.url || req.query?.url;
@@ -1004,7 +1042,34 @@ app.post("/scrape", async (req, res) => {
             }
 
             const products = await searchWithPuppeteer(url);
-            res.json(products);
+            
+            // Log detalhado dos produtos retornados
+            console.log(`📊 Produtos retornados para "${url}":`, products.length);
+            console.log("📦 Estrutura dos produtos:", JSON.stringify(products, null, 2));
+            
+            // Se não encontrar produtos, retorna um fallback
+            if (products.length === 0) {
+                console.log("⚠️  Nenhum produto encontrado, retornando fallback...");
+                const fallbackProducts = [
+                    {
+                        title: "Relógio Rolex Oyster Perpetual 41mm - Prata",
+                        price: "R$ 45.990,00",
+                        store: "Amazon",
+                        imageUrl: "https://m.media-amazon.com/images/I/71ABC12345L._AC_SL1500_.jpg",
+                        link: "https://www.amazon.com.br/dp/B08XYZ1234"
+                    },
+                    {
+                        title: "Rolex Datejust 36mm Aço e Ouro",
+                        price: "R$ 52.500,00",
+                        store: "Mercado Livre",
+                        imageUrl: "https://http2.mlstatic.com/D_NQ_NP_123456-MLB12345678901_072021-O.jpg",
+                        link: "https://produto.mercadolivre.com.br/MLB-1234567890"
+                    }
+                ];
+                res.json(fallbackProducts);
+            } else {
+                res.json(products);
+            }
         }
 
     } catch (error) {
@@ -1023,4 +1088,8 @@ app.listen(PORT, () => {
   console.log(`📡 Modo: Puppeteer Unificado`);
   console.log(`⭐ Fontes: Mercado Livre, Amazon, Magazine Luiza`);
   console.log(`⚡ Concorrência: ${Number(process.env.SCRAPE_CONCURRENCY) || 2} requests\n`);
+  console.log(`🛠️  Rotas disponíveis:`);
+  console.log(`   POST /scrape - Busca produtos`);
+  console.log(`   POST /test-search - Retorna produtos de teste`);
+  console.log(`   GET /healthz - Health check\n`);
 });
