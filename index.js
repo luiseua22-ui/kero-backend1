@@ -1,4 +1,4 @@
-// index.js - scraper completo com Puppeteer para todas as buscas
+// index.js - scraper inteligente com múltiplas fontes especializadas
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -17,16 +17,68 @@ const limiter = rateLimit({ windowMs: 10 * 1000, max: 30 });
 app.use(limiter);
 
 const queue = new PQueue({ 
-  concurrency: Number(process.env.SCRAPE_CONCURRENCY) || 2,
-  timeout: 45000
+  concurrency: Number(process.env.SCRAPE_CONCURRENCY) || 3,
+  timeout: 60000
 });
 
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ---------------- BUSCA UNIFICADA COM PUPPETEER ----------------
+// ---------------- CLASSIFICAÇÃO DE PRODUTOS ----------------
+
+function detectProductType(query) {
+  const q = query.toLowerCase();
+  
+  const categories = {
+    // Eletrônicos e Tecnologia
+    'eletronicos': /(celular|smartphone|iphone|samsung|xiaomi|motorola|notebook|laptop|tablet|ipad|smart watch|relógio inteligente|fone de ouvido|airpods|fone bluetooth|mouse|teclado|monitor|tv|smart tv)/,
+    'informatica': /(computador|pc|macbook|windows|linux|ssd|hd|memória ram|placa de vídeo|processador|gamer|gaming)/,
+    
+    // Livros e Mídia
+    'livros': /(livro|ebook|kindle|leitor digital|biblioteca|romance|ficção|não ficção|literatura|autor|escrever|ler)/,
+    'midia': /(cd|dvd|blu-ray|vinil|filme|série|jogo de tabuleiro|board game)/,
+    
+    // Moda e Acessórios
+    'moda': /(camisa|camiseta|blusa|calça|short|bermuda|vestido|saia|casaco|jaqueta|tênis|sapato|bota|chinelo|sandália|bolsa|mochila|carteira|óculos|relógio|joia|anel|colar|brinco|pulseira)/,
+    'luxo': /(rolex|omega|cartier|patek|audemars|breitling|tag heuer|montblanc|louis vuitton|gucci|prada|chanel|hermes|dior)/,
+    
+    // Casa e Decoração
+    'casa': /(sofá|cama|mesa|cadeira|armário|guarda-roupa|estante|prateleira|decoração|quadro|almofada|cortina|tapete|toalha|cama mesa banho)/,
+    'eletrodomesticos': /(geladeira|fogão|microondas|lavadora|máquina de lavar|secadora|batedeira|liquidificador|air fryer|fritadeira|panela|pressão)/,
+    
+    // Esportes e Lazer
+    'esportes': /(bola|raquete|tênis esportivo|academia|suplemento|proteína|creatina|bicicleta|skate|patins|equipamento|esportivo)/,
+    'brinquedos': /(brinquedo|lego|boneca|carrinho|hot wheels|pelúcia|urso|jogo educativo|infantil)/,
+    
+    // Beleza e Saúde
+    'beleza': /(perfume|maquiagem|batom|rimel|base|creme|shampoo|condicionador|sabonete|esmalte|barbeador|aparelho barbear|depilação)/,
+    'saude': /(vitamina|medicamento|termômetro|pressão arterial|aparelho auditivo|órtese|prótese)/,
+    
+    // Automotivo
+    'automotivo': /(pneu|bateria|óleo|motor|capô|parachoque|farol|lanterna|retrovisor|volante|câmbio|freio|suspensão)/,
+    
+    // Ferramentas e Construção
+    'ferramentas': /(martelo|chave|furadeira|parafusadeira|serra|trena|nível|alicante|grampo|tinta|pincel|rolo|argamassa|cimento)/,
+    
+    // Alimentos e Bebidas
+    'alimentos': /(arroz|feijão|macarrão|óleo|açúcar|sal|farinha|biscoito|bolacha|chocolate|doce|geleia|molho|tempero)/,
+    'bebidas': /(refrigerante|suco|água|cerveja|vinho|whisky|vodka|rum|licor|cachaça|energético)/,
+  };
+  
+  for (const [category, pattern] of Object.entries(categories)) {
+    if (pattern.test(q)) {
+      return category;
+    }
+  }
+  
+  return 'geral'; // Categoria padrão
+}
+
+// ---------------- BUSCA INTELIGENTE COM FONTES ESPECIALIZADAS ----------------
 
 async function searchWithPuppeteer(query) {
-  console.log(`🔍 Iniciando busca com Puppeteer para: "${query}"`);
+  console.log(`🔍 Iniciando busca inteligente para: "${query}"`);
+  const productType = detectProductType(query);
+  console.log(`🏷️  Categoria detectada: ${productType}`);
   
   const browser = await puppeteer.launch({
     headless: "new",
@@ -62,45 +114,74 @@ async function searchWithPuppeteer(query) {
     });
 
     const results = [];
+    const sourcesToTry = getSourcesForProductType(productType);
     
-    // 1. Tenta Mercado Livre primeiro (mais confiável no Brasil)
-    console.log("🌐 Tentando Mercado Livre...");
-    try {
-      const mlResults = await searchMercadoLivre(page, query);
-      results.push(...mlResults);
-      console.log(`✅ Mercado Livre: ${mlResults.length} produtos`);
-    } catch (error) {
-      console.log("❌ Mercado Livre falhou:", error.message);
-    }
-
-    // 2. Tenta Amazon
-    console.log("🌐 Tentando Amazon...");
-    try {
-      const amazonResults = await searchAmazon(page, query);
-      results.push(...amazonResults);
-      console.log(`✅ Amazon: ${amazonResults.length} produtos`);
-    } catch (error) {
-      console.log("❌ Amazon falhou:", error.message);
-    }
-
-    // 3. Tenta Magazine Luiza diretamente (mais simples)
-    console.log("🌐 Tentando Magazine Luiza...");
-    try {
-      const magaluResults = await searchMagazineLuizaDirect(page, query);
-      results.push(...magaluResults);
-      console.log(`✅ Magazine Luiza: ${magaluResults.length} produtos`);
-    } catch (error) {
-      console.log("❌ Magazine Luiza falhou:", error.message);
-    }
+    console.log(`📋 Fontes selecionadas: ${sourcesToTry.join(', ')}`);
+    
+    // Executa busca nas fontes em paralelo para velocidade
+    const searchPromises = sourcesToTry.map(source => {
+      switch(source) {
+        case 'mercadolivre':
+          return searchMercadoLivre(page, query).catch(() => []);
+        case 'amazon':
+          return searchAmazon(page, query).catch(() => []);
+        case 'magazineluiza':
+          return searchMagazineLuiza(page, query).catch(() => []);
+        case 'americanas':
+          return searchAmericanas(page, query).catch(() => []);
+        case 'submarino':
+          return searchSubmarino(page, query).catch(() => []);
+        case 'kabum':
+          return searchKabum(page, query).catch(() => []);
+        case 'fastshop':
+          return searchFastShop(page, query).catch(() => []);
+        case 'netshoes':
+          return searchNetshoes(page, query).catch(() => []);
+        case 'centauro':
+          return searchCentauro(page, query).catch(() => []);
+        case 'zoom':
+          return searchZoom(page, query).catch(() => []);
+        case 'extra':
+          return searchExtra(page, query).catch(() => []);
+        case 'pontofrio':
+          return searchPontoFrio(page, query).catch(() => []);
+        case 'casasbahia':
+          return searchCasasBahia(page, query).catch(() => []);
+        case 'shoptime':
+          return searchShoptime(page, query).catch(() => []);
+        case 'dafiti':
+          return searchDafiti(page, query).catch(() => []);
+        case 'google_shopping':
+          return searchGoogleShopping(page, query).catch(() => []);
+        default:
+          return Promise.resolve([]);
+      }
+    });
+    
+    // Aguarda todas as buscas
+    const allResults = await Promise.all(searchPromises);
+    
+    // Combina resultados
+    allResults.forEach((sourceResults, index) => {
+      results.push(...sourceResults);
+      console.log(`✅ ${sourcesToTry[index]}: ${sourceResults.length} produtos`);
+    });
 
     // Remove duplicatas
     const uniqueResults = removeDuplicates(results);
     console.log(`🎯 Total de produtos únicos: ${uniqueResults.length}`);
     
-    // Log dos produtos encontrados para debug
-    console.log("📦 Produtos encontrados:", JSON.stringify(uniqueResults, null, 2));
+    // Se poucos resultados, tenta busca genérica em mais fontes
+    if (uniqueResults.length < 5 && productType !== 'geral') {
+      console.log("🔎 Buscando em fontes adicionais...");
+      const additionalResults = await searchGenericSources(page, query);
+      uniqueResults.push(...additionalResults);
+    }
     
-    return uniqueResults.slice(0, 15);
+    // Ordena por relevância (primeiro resultados das fontes principais)
+    const sortedResults = prioritizeResults(uniqueResults, sourcesToTry);
+    
+    return sortedResults.slice(0, 20);
 
   } catch (error) {
     console.error("❌ Erro geral na busca:", error);
@@ -110,243 +191,788 @@ async function searchWithPuppeteer(query) {
   }
 }
 
-async function searchAmazon(page, query) {
-  const searchUrl = `https://www.amazon.com.br/s?k=${encodeURIComponent(query)}&__mk_pt_BR=%C3%85M%C3%85%C5%BD%C3%95%C3%91&crid=2VGEQA0R25W1P&sprefix=${encodeURIComponent(query)}%2Caps%2C238`;
-  
-  try {
-    console.log(`🌍 Acessando Amazon: ${searchUrl}`);
-    await page.goto(searchUrl, { 
-      waitUntil: "networkidle2", 
-      timeout: 25000 
-    });
+function getSourcesForProductType(productType) {
+  const sourceConfig = {
+    // Fontes principais (sempre tentadas primeiro)
+    primary: ['mercadolivre', 'amazon', 'magazineluiza'],
     
-    await page.waitForTimeout(4000);
-
-    return await page.evaluate(() => {
-      const results = [];
-      // Seletores atualizados para Amazon Brasil 2024
-      const items = document.querySelectorAll('[data-component-type="s-search-result"], .s-result-item, div[data-asin]:not([data-asin=""])');
-      
-      console.log(`📊 Total de itens encontrados no DOM: ${items.length}`);
-      
-      for (const item of items) {
-        try {
-          // Título - seletores múltiplos
-          const titleEl = item.querySelector('h2 a span') || 
-                         item.querySelector('.a-size-base-plus') ||
-                         item.querySelector('.a-text-normal');
-          
-          // Preço - seletores múltiplos
-          const priceWhole = item.querySelector('.a-price-whole');
-          const priceFraction = item.querySelector('.a-price-fraction');
-          const priceSymbol = item.querySelector('.a-price-symbol');
-          
-          // Imagem
-          const imageEl = item.querySelector('.s-image') || 
-                         item.querySelector('img.s-image') ||
-                         item.querySelector('[data-image-latency="s-product-image"]');
-          
-          // Link
-          const linkEl = item.querySelector('h2 a') || 
-                        item.querySelector('a.a-link-normal.s-no-outline');
-          
-          if (titleEl && (priceWhole || priceSymbol) && linkEl) {
-            const title = titleEl.textContent.trim();
-            let price = '';
-            
-            if (priceWhole && priceFraction) {
-              price = `R$ ${priceWhole.textContent.trim()}${priceFraction.textContent.trim()}`;
-            } else if (priceSymbol && priceSymbol.textContent.includes('R$')) {
-              price = priceSymbol.textContent.trim();
-            } else if (priceWhole) {
-              price = `R$ ${priceWhole.textContent.trim()}`;
-            } else {
-              // Tenta encontrar preço em outros seletores
-              const altPrice = item.querySelector('.a-price .a-offscreen');
-              if (altPrice) {
-                price = altPrice.textContent.trim();
-              }
-            }
-            
-            const imageUrl = imageEl ? (imageEl.src || imageEl.getAttribute('data-src') || '') : '';
-            const link = linkEl.href;
-            
-            if (title && price && price.length > 0) {
-              console.log(`✅ Produto Amazon encontrado: ${title.substring(0, 50)}... - ${price}`);
-              results.push({
-                title: title.length > 80 ? title.substring(0, 80) + '...' : title,
-                price: price,
-                store: 'Amazon',
-                imageUrl,
-                link: link.split('?')[0]
-              });
-            } else {
-              console.log(`⚠️  Produto Amazon sem preço: ${title ? title.substring(0, 50) : 'Sem título'}`);
-            }
-          }
-        } catch (e) {
-          console.error(`❌ Erro ao processar item Amazon:`, e.message);
-          continue;
-        }
-        
-        if (results.length >= 6) break;
-      }
-      
-      console.log(`📈 Produtos Amazon processados: ${results.length}`);
-      return results;
-    });
-  } catch (error) {
-    console.error("❌ Amazon error:", error.message);
-    return [];
-  }
+    // Fontes por categoria
+    eletronicos: ['kabum', 'extra', 'fastshop', 'submarino', 'americanas'],
+    informatica: ['kabum', 'americanas', 'submarino', 'extra'],
+    livros: ['amazon', 'submarino', 'americanas', 'shoptime'],
+    midia: ['submarino', 'americanas', 'shoptime', 'extra'],
+    moda: ['dafiti', 'netshoes', 'americanas', 'shoptime'],
+    luxo: ['mercadolivre', 'americanas', 'extra', 'google_shopping'],
+    casa: ['magazineluiza', 'americanas', 'casasbahia', 'pontofrio', 'extra'],
+    eletrodomesticos: ['magazineluiza', 'casasbahia', 'pontofrio', 'extra', 'americanas'],
+    esportes: ['centauro', 'netshoes', 'americanas', 'submarino'],
+    brinquedos: ['magazineluiza', 'americanas', 'submarino', 'shoptime'],
+    beleza: ['magazineluiza', 'americanas', 'submarino', 'shoptime'],
+    saude: ['magazineluiza', 'americanas', 'drogasil', 'drogaraia'],
+    automotivo: ['mercadolivre', 'americanas', 'extra'],
+    ferramentas: ['mercadolivre', 'americanas', 'magazineluiza'],
+    alimentos: ['mercadolivre', 'paodeacucar', 'extra'],
+    bebidas: ['mercadolivre', 'paodeacucar', 'extra'],
+    geral: ['mercadolivre', 'amazon', 'magazineluiza', 'americanas', 'submarino', 'google_shopping']
+  };
+  
+  const primary = sourceConfig.primary;
+  const specific = sourceConfig[productType] || sourceConfig.geral;
+  
+  // Combina fontes, removendo duplicatas
+  return [...new Set([...primary, ...specific])];
 }
 
+function prioritizeResults(results, sourcesOrder) {
+  return results.sort((a, b) => {
+    // Dá prioridade às fontes principais
+    const aIndex = sourcesOrder.indexOf(a.store.toLowerCase().replace(' ', ''));
+    const bIndex = sourcesOrder.indexOf(b.store.toLowerCase().replace(' ', ''));
+    
+    if (aIndex !== -1 && bIndex !== -1) {
+      return aIndex - bIndex;
+    }
+    if (aIndex !== -1) return -1;
+    if (bIndex !== -1) return 1;
+    
+    // Depois ordena por preço (mais barato primeiro)
+    const priceA = parseFloat(a.price.replace(/[^\d,]/g, '').replace(',', '.'));
+    const priceB = parseFloat(b.price.replace(/[^\d,]/g, '').replace(',', '.'));
+    
+    return priceA - priceB;
+  });
+}
+
+// ---------------- FUNÇÕES DE BUSCA POR FONTE ----------------
+
 async function searchMercadoLivre(page, query) {
-  // URL corrigida para busca
   const searchUrl = `https://lista.mercadolivre.com.br/${encodeURIComponent(query.replace(/\s+/g, '-'))}`;
   
   try {
-    console.log(`🌍 Acessando Mercado Livre: ${searchUrl}`);
-    await page.goto(searchUrl, { 
-      waitUntil: "networkidle2", 
-      timeout: 25000 
-    });
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
     
-    await page.waitForTimeout(4000);
-
     return await page.evaluate(() => {
       const results = [];
-      // Seletores atualizados Mercado Livre
-      const items = document.querySelectorAll('.ui-search-layout__item, .andes-card, [data-testid="product-card"], li.ui-search-layout__item');
+      const items = document.querySelectorAll('.ui-search-layout__item');
       
-      console.log(`📊 Total de itens encontrados no DOM: ${items.length}`);
-      
-      for (const item of items) {
+      items.forEach(item => {
         try {
-          // Título
-          const titleEl = item.querySelector('.ui-search-item__title') || 
-                         item.querySelector('.ui-search-item__group--title');
-          
-          // Preço
-          const priceEl = item.querySelector('.andes-money-amount__fraction') || 
-                         item.querySelector('.price-tag-fraction') ||
-                         item.querySelector('.ui-search-price__part');
-          
-          // Imagem
-          const imageEl = item.querySelector('.ui-search-result-image__element') || 
-                         item.querySelector('img.ui-search-result-image__element') ||
-                         item.querySelector('[data-src]');
-          
-          // Link
-          const linkEl = item.querySelector('.ui-search-link') || 
-                        item.querySelector('a.ui-search-link__title-card') ||
-                        item.querySelector('a[href*="/p/"]');
+          const titleEl = item.querySelector('.ui-search-item__title');
+          const priceEl = item.querySelector('.andes-money-amount__fraction');
+          const imageEl = item.querySelector('.ui-search-result-image__element');
+          const linkEl = item.querySelector('.ui-search-link');
           
           if (titleEl && priceEl && linkEl) {
             const title = titleEl.textContent.trim();
-            const priceText = priceEl.textContent.trim();
-            const price = priceText.includes('R$') ? priceText : `R$ ${priceText}`;
-            const imageUrl = imageEl ? (imageEl.src || imageEl.getAttribute('data-src') || imageEl.getAttribute('src') || '') : '';
-            const link = linkEl.href;
+            const price = `R$ ${priceEl.textContent.trim()}`;
+            const imageUrl = imageEl?.src || imageEl?.getAttribute('data-src') || '';
+            const link = linkEl.href.split('?')[0];
             
-            if (title && price && price.length > 0) {
-              console.log(`✅ Produto Mercado Livre encontrado: ${title.substring(0, 50)}... - ${price}`);
-              results.push({
-                title: title.length > 80 ? title.substring(0, 80) + '...' : title,
-                price: price,
-                store: 'Mercado Livre',
-                imageUrl,
-                link: link.split('?')[0]
-              });
-            } else {
-              console.log(`⚠️  Produto Mercado Livre sem preço: ${title ? title.substring(0, 50) : 'Sem título'}`);
-            }
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Mercado Livre',
+              imageUrl,
+              link
+            });
           }
-        } catch (e) {
-          console.error(`❌ Erro ao processar item Mercado Livre:`, e.message);
-          continue;
-        }
-        
-        if (results.length >= 6) break;
-      }
+        } catch (e) {}
+      });
       
-      console.log(`📈 Produtos Mercado Livre processados: ${results.length}`);
-      return results;
+      return results.slice(0, 10);
     });
   } catch (error) {
-    console.error("❌ Mercado Livre error:", error.message);
     return [];
   }
 }
 
-async function searchMagazineLuizaDirect(page, query) {
+async function searchAmazon(page, query) {
+  const searchUrl = `https://www.amazon.com.br/s?k=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('[data-component-type="s-search-result"]');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('h2 a span');
+          const priceWhole = item.querySelector('.a-price-whole');
+          const priceFraction = item.querySelector('.a-price-fraction');
+          const imageEl = item.querySelector('.s-image');
+          const linkEl = item.querySelector('h2 a');
+          
+          if (titleEl && (priceWhole || priceFraction) && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceWhole && priceFraction 
+              ? `R$ ${priceWhole.textContent.trim()}${priceFraction.textContent.trim()}`
+              : 'Preço sob consulta';
+            const imageUrl = imageEl?.src || '';
+            const link = `https://www.amazon.com.br${linkEl.getAttribute('href')}`.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Amazon',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchMagazineLuiza(page, query) {
   const searchUrl = `https://www.magazineluiza.com.br/busca/${encodeURIComponent(query)}/`;
   
   try {
-    console.log(`🌍 Acessando Magazine Luiza: ${searchUrl}`);
-    await page.goto(searchUrl, { 
-      waitUntil: "domcontentloaded", 
-      timeout: 20000 
-    });
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
     
-    await page.waitForTimeout(3000);
-
     return await page.evaluate(() => {
       const results = [];
-      const items = document.querySelectorAll('[data-testid="product-card"], .product, [data-testid="product-list"] li');
+      const items = document.querySelectorAll('[data-testid="product-card"]');
       
-      console.log(`📊 Total de itens encontrados no DOM: ${items.length}`);
-      
-      for (const item of items) {
+      items.forEach(item => {
         try {
-          const titleEl = item.querySelector('[data-testid="product-title"]') || 
-                         item.querySelector('.productTitle') ||
-                         item.querySelector('h2');
-          
-          const priceEl = item.querySelector('[data-testid="price-value"]') || 
-                         item.querySelector('.price') ||
-                         item.querySelector('[class*="price"]');
-          
-          const imageEl = item.querySelector('img') || 
-                         item.querySelector('[data-testid="image"]');
-          
-          const linkEl = item.querySelector('a') || 
-                        item.querySelector('[href*="/produto/"]');
+          const titleEl = item.querySelector('[data-testid="product-title"]');
+          const priceEl = item.querySelector('[data-testid="price-value"]');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
           
           if (titleEl && priceEl && linkEl) {
             const title = titleEl.textContent.trim();
             const price = priceEl.textContent.trim();
-            const imageUrl = imageEl ? (imageEl.src || imageEl.getAttribute('src') || '') : '';
-            const link = linkEl.href.startsWith('http') ? linkEl.href : `https://www.magazineluiza.com.br${linkEl.href}`;
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
             
-            if (title && price && price.length < 50) { // Filtra preços inválidos
-              console.log(`✅ Produto Magazine Luiza encontrado: ${title.substring(0, 50)}... - ${price}`);
-              results.push({
-                title: title.length > 80 ? title.substring(0, 80) + '...' : title,
-                price: price.includes('R$') ? price : `R$ ${price}`,
-                store: 'Magazine Luiza',
-                imageUrl,
-                link: link.split('?')[0]
-              });
-            } else {
-              console.log(`⚠️  Produto Magazine Luiza sem preço ou preço inválido: ${title ? title.substring(0, 50) : 'Sem título'}`);
-            }
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Magazine Luiza',
+              imageUrl,
+              link
+            });
           }
-        } catch (e) {
-          console.error(`❌ Erro ao processar item Magazine Luiza:`, e.message);
-          continue;
-        }
-        
-        if (results.length >= 5) break;
-      }
+        } catch (e) {}
+      });
       
-      console.log(`📈 Produtos Magazine Luiza processados: ${results.length}`);
-      return results;
+      return results.slice(0, 10);
     });
   } catch (error) {
-    console.error("❌ Magazine Luiza error:", error.message);
     return [];
   }
+}
+
+async function searchAmericanas(page, query) {
+  const searchUrl = `https://www.americanas.com.br/busca/${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('[data-testid="product-card"]');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('h3');
+          const priceEl = item.querySelector('[class*="price__Price"]');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Americanas',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchSubmarino(page, query) {
+  const searchUrl = `https://www.submarino.com.br/busca/${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('[data-testid="product-card"]');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('h3');
+          const priceEl = item.querySelector('[class*="price__Price"]');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Submarino',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchKabum(page, query) {
+  const searchUrl = `https://www.kabum.com.br/busca/${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('.productCard');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('.nameCard');
+          const priceEl = item.querySelector('.priceCard');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Kabum',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchFastShop(page, query) {
+  const searchUrl = `https://www.fastshop.com.br/web/c/busca?Ntt=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('.prateleira ul li');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('.product-name');
+          const priceEl = item.querySelector('.best-price');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Fast Shop',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchNetshoes(page, query) {
+  const searchUrl = `https://www.netshoes.com.br/busca?q=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('.item-card');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('.item-card__description');
+          const priceEl = item.querySelector('.price');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Netshoes',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchCentauro(page, query) {
+  const searchUrl = `https://www.centauro.com.br/busca?q=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('.product-item');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('.product-name');
+          const priceEl = item.querySelector('.price');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Centauro',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchZoom(page, query) {
+  const searchUrl = `https://www.zoom.com.br/search?q=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('.ProductCard');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('.ProductCard-Name');
+          const priceEl = item.querySelector('.ProductCard-PriceValue');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Zoom',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchExtra(page, query) {
+  const searchUrl = `https://www.extra.com.br/busca?q=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('[data-testid="product-card"]');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('h3');
+          const priceEl = item.querySelector('[class*="price__Price"]');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Extra',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchPontoFrio(page, query) {
+  const searchUrl = `https://www.pontofrio.com.br/busca?q=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('[data-testid="product-card"]');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('h3');
+          const priceEl = item.querySelector('[class*="price__Price"]');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Ponto Frio',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchCasasBahia(page, query) {
+  const searchUrl = `https://www.casasbahia.com.br/busca?q=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('[data-testid="product-card"]');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('h3');
+          const priceEl = item.querySelector('[class*="price__Price"]');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Casas Bahia',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchShoptime(page, query) {
+  const searchUrl = `https://www.shoptime.com.br/busca?q=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('[data-testid="product-card"]');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('h3');
+          const priceEl = item.querySelector('[class*="price__Price"]');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Shoptime',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchDafiti(page, query) {
+  const searchUrl = `https://www.dafiti.com.br/busca/?q=${encodeURIComponent(query)}`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('.product-box');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('.product-name');
+          const priceEl = item.querySelector('.price');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Dafiti',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchGoogleShopping(page, query) {
+  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&tbm=shop`;
+  
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    
+    return await page.evaluate(() => {
+      const results = [];
+      const items = document.querySelectorAll('.sh-dgr__content');
+      
+      items.forEach(item => {
+        try {
+          const titleEl = item.querySelector('h3');
+          const priceEl = item.querySelector('.a8Pemb');
+          const imageEl = item.querySelector('img');
+          const linkEl = item.querySelector('a');
+          
+          if (titleEl && priceEl && linkEl) {
+            const title = titleEl.textContent.trim();
+            const price = priceEl.textContent.trim();
+            const imageUrl = imageEl?.src || '';
+            const link = linkEl.href.split('?')[0];
+            
+            results.push({
+              title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+              price,
+              store: 'Google Shopping',
+              imageUrl,
+              link
+            });
+          }
+        } catch (e) {}
+      });
+      
+      return results.slice(0, 10);
+    });
+  } catch (error) {
+    return [];
+  }
+}
+
+async function searchGenericSources(page, query) {
+  // Fontes genéricas adicionais
+  const sources = [
+    { name: 'Walmart', url: `https://www.walmart.com.br/busca?q=${encodeURIComponent(query)}` },
+    { name: 'Carrefour', url: `https://www.carrefour.com.br/busca?q=${encodeURIComponent(query)}` },
+    { name: 'MadeiraMadeira', url: `https://www.madeiramadeira.com.br/busca?q=${encodeURIComponent(query)}` },
+  ];
+  
+  const results = [];
+  
+  for (const source of sources) {
+    try {
+      await page.goto(source.url, { waitUntil: "domcontentloaded", timeout: 10000 });
+      await page.waitForTimeout(1000);
+      
+      const sourceResults = await page.evaluate((storeName) => {
+        const localResults = [];
+        const items = document.querySelectorAll('[class*="product"], [class*="card"], [class*="item"]');
+        
+        items.slice(0, 5).forEach(item => {
+          try {
+            const titleEl = item.querySelector('h3, h2, .title, .name');
+            const priceEl = item.querySelector('.price, .value, .cost');
+            const imageEl = item.querySelector('img');
+            const linkEl = item.querySelector('a');
+            
+            if (titleEl && priceEl && linkEl) {
+              const title = titleEl.textContent.trim();
+              const price = priceEl.textContent.trim();
+              const imageUrl = imageEl?.src || '';
+              const link = linkEl.href.split('?')[0];
+              
+              localResults.push({
+                title: title.length > 80 ? title.substring(0, 80) + '...' : title,
+                price: price.includes('R$') ? price : `R$ ${price}`,
+                store: storeName,
+                imageUrl,
+                link
+              });
+            }
+          } catch (e) {}
+        });
+        
+        return localResults;
+      }, source.name);
+      
+      results.push(...sourceResults);
+    } catch (error) {
+      continue;
+    }
+  }
+  
+  return results;
 }
 
 function removeDuplicates(products) {
@@ -356,8 +982,9 @@ function removeDuplicates(products) {
   for (const product of products) {
     if (!product.title || !product.price) continue;
     
-    const key = product.title.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 50);
-    if (!seen.has(key) && product.title && product.price) {
+    // Cria uma chave única baseada no título e preço
+    const key = `${product.title.substring(0, 50).toLowerCase()}_${product.price}`;
+    if (!seen.has(key)) {
       seen.add(key);
       unique.push(product);
     }
@@ -366,7 +993,7 @@ function removeDuplicates(products) {
   return unique;
 }
 
-// ---------------- FUNÇÕES ORIGINAIS MANTIDAS ----------------
+// ---------------- FUNÇÕES ORIGINAIS MANTIDAS (para scraping de URL única) ----------------
 
 function sanitizeIncomingUrl(raw) {
     if (!raw || typeof raw !== "string") return null;
@@ -998,28 +1625,6 @@ async function scrapeProduct(rawUrl) {
 // ---------------- ROTAS ----------------
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
-// Rota de teste para verificar se o backend está funcionando
-app.post("/test-search", (req, res) => {
-  const mockProducts = [
-    {
-        title: "Relógio Rolex Oyster Perpetual 41mm",
-        price: "R$ 45.990,00",
-        store: "Amazon",
-        imageUrl: "https://m.media-amazon.com/images/I/71ABC12345L._AC_SL1500_.jpg",
-        link: "https://www.amazon.com.br/dp/B08XYZ1234"
-    },
-    {
-        title: "Rolex Datejust 36mm Aço Ouro",
-        price: "R$ 52.500,00",
-        store: "Mercado Livre",
-        imageUrl: "https://http2.mlstatic.com/D_NQ_NP_123456-MLB12345678901_072021-O.jpg",
-        link: "https://produto.mercadolivre.com.br/MLB-1234567890"
-    }
-  ];
-  console.log('✅ Retornando produtos de teste');
-  res.json(mockProducts);
-});
-
 app.post("/scrape", async (req, res) => {
     try {
         const url = req.body?.url || req.query?.url;
@@ -1043,33 +1648,9 @@ app.post("/scrape", async (req, res) => {
 
             const products = await searchWithPuppeteer(url);
             
-            // Log detalhado dos produtos retornados
             console.log(`📊 Produtos retornados para "${url}":`, products.length);
-            console.log("📦 Estrutura dos produtos:", JSON.stringify(products, null, 2));
             
-            // Se não encontrar produtos, retorna um fallback
-            if (products.length === 0) {
-                console.log("⚠️  Nenhum produto encontrado, retornando fallback...");
-                const fallbackProducts = [
-                    {
-                        title: "Relógio Rolex Oyster Perpetual 41mm - Prata",
-                        price: "R$ 45.990,00",
-                        store: "Amazon",
-                        imageUrl: "https://m.media-amazon.com/images/I/71ABC12345L._AC_SL1500_.jpg",
-                        link: "https://www.amazon.com.br/dp/B08XYZ1234"
-                    },
-                    {
-                        title: "Rolex Datejust 36mm Aço e Ouro",
-                        price: "R$ 52.500,00",
-                        store: "Mercado Livre",
-                        imageUrl: "https://http2.mlstatic.com/D_NQ_NP_123456-MLB12345678901_072021-O.jpg",
-                        link: "https://produto.mercadolivre.com.br/MLB-1234567890"
-                    }
-                ];
-                res.json(fallbackProducts);
-            } else {
-                res.json(products);
-            }
+            res.json(products);
         }
 
     } catch (error) {
@@ -1085,11 +1666,8 @@ app.post("/scrape", async (req, res) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`\n🎯 Backend rodando na porta ${PORT}`);
-  console.log(`📡 Modo: Puppeteer Unificado`);
-  console.log(`⭐ Fontes: Mercado Livre, Amazon, Magazine Luiza`);
-  console.log(`⚡ Concorrência: ${Number(process.env.SCRAPE_CONCURRENCY) || 2} requests\n`);
-  console.log(`🛠️  Rotas disponíveis:`);
-  console.log(`   POST /scrape - Busca produtos`);
-  console.log(`   POST /test-search - Retorna produtos de teste`);
-  console.log(`   GET /healthz - Health check\n`);
+  console.log(`📡 Modo: Busca Inteligente Multi-fonte`);
+  console.log(`🏷️  Categorias: Eletrônicos, Livros, Moda, Casa, Esportes, Beleza, etc.`);
+  console.log(`⭐ Fontes: 15+ marketplaces brasileiros`);
+  console.log(`⚡ Concorrência: ${Number(process.env.SCRAPE_CONCURRENCY) || 3} requests\n`);
 });
