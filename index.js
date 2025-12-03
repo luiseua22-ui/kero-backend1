@@ -182,7 +182,7 @@ function getFallbackProducts(query) {
   }];
 }
 
-// ---------------- SCRAPING INDIVIDUAL (CORRIGIDO PARA PREÇO) ----------------
+// ---------------- SCRAPING INDIVIDUAL (CORRIGIDO PARA MORANA E OUTROS) ----------------
 
 async function scrapeProduct(rawUrl) {
   return queue.add(async () => {
@@ -206,7 +206,7 @@ async function scrapeProduct(rawUrl) {
 
       const page = await browser.newPage();
       
-      // HEADERS ROBUSTOS (Para enganar Amazon)
+      // HEADERS ROBUSTOS
       await page.setUserAgent(DEFAULT_USER_AGENT);
       await page.setExtraHTTPHeaders({ 
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -224,38 +224,53 @@ async function scrapeProduct(rawUrl) {
         
         // Remove sufixos comuns
         if (title) {
-            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee'];
+            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee', ' | Morana'];
             storeSuffixes.forEach(s => title = title.split(s)[0]);
         }
 
-        // --- PREÇO (LÓGICA BLINDADA) ---
+        // --- PREÇO (LÓGICA BLINDADA ANTI-FRETE) ---
         let price = null;
         
-        // 1. JSON-LD (Melhor opção)
-        const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-        for (const script of scripts) {
-            try {
-                const json = JSON.parse(script.innerText);
-                if (json['@type'] === 'Product' && json.offers) {
-                     const offer = Array.isArray(json.offers) ? json.offers[0] : json.offers;
-                     if (offer.price) { price = offer.price; break; }
-                }
-                if (json['@graph']) {
-                    const p = json['@graph'].find(i => i['@type'] === 'Product');
-                    if (p?.offers?.price) { price = p.offers.price; break; }
-                }
-            } catch(e) {}
+        // 0. Meta Tags (Muitas vezes contém o preço limpo)
+        const metaPrice = document.querySelector('meta[property="product:price:amount"]')?.getAttribute('content') ||
+                          document.querySelector('meta[property="og:price:amount"]')?.getAttribute('content');
+        if (metaPrice && metaPrice.match(/\d/)) {
+            price = metaPrice;
         }
 
-        // 2. Seletores Visuais
+        // 1. JSON-LD (Melhor opção técnica)
+        if (!price) {
+            const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+            for (const script of scripts) {
+                try {
+                    const json = JSON.parse(script.innerText);
+                    if (json['@type'] === 'Product' && json.offers) {
+                        const offer = Array.isArray(json.offers) ? json.offers[0] : json.offers;
+                        if (offer.price) { price = offer.price; break; }
+                        if (offer.lowPrice) { price = offer.lowPrice; break; }
+                    }
+                    if (json['@graph']) {
+                        const p = json['@graph'].find(i => i['@type'] === 'Product');
+                        if (p?.offers?.price) { price = p.offers.price; break; }
+                    }
+                } catch(e) {}
+            }
+        }
+
+        // 2. Seletores Visuais Específicos (Incluindo VTEX/Morana)
         if (!price) {
             const priceSelectors = [
-              '.price', '[itemprop="price"]', 
-              '.a-price-whole',                 // Amazon
-              '.andes-money-amount__fraction',  // Mercado Livre
-              '[data-testid="price-value"]',    // Magalu
-              '.product-price-value',
-              '.sales-price'
+              '.skuBestPrice',                // VTEX (Morana)
+              '.best-price',
+              '.val-best-price',
+              '.product-price', 
+              '.price', 
+              '[itemprop="price"]', 
+              '.a-price-whole',               // Amazon
+              '.andes-money-amount__fraction',// Mercado Livre
+              '[data-testid="price-value"]',  // Magalu
+              '.sales-price',
+              '.current-price'
             ];
             for (const sel of priceSelectors) {
                 const el = document.querySelector(sel);
@@ -270,10 +285,22 @@ async function scrapeProduct(rawUrl) {
             }
         }
         
-        // 3. REGEX NO CORPO DA PÁGINA (Último recurso)
+        // 3. REGEX (ÚLTIMO RECURSO - RESTRITO AO CONTEÚDO PRINCIPAL)
+        // Isso impede que pegue "Frete R$ 50,00" do cabeçalho
         if (!price) {
-           const bodyText = document.body.innerText;
-           // Procura por padrão R$ XX,XX próximo ao topo
+           // Tenta encontrar o container do produto ou o main, ignorando header/nav
+           const mainContent = document.querySelector('main') || 
+                               document.querySelector('.product-container') || 
+                               document.querySelector('#product-content') || 
+                               document.querySelector('.vtex-store-components-3-x-productContainer') || // VTEX especifico
+                               document.body; // Fallback perigoso mas necessário
+                               
+           // Se formos forçados a usar o body, tentamos pular o header cortando os primeiros 500 caracteres se o texto for muito longo? 
+           // Melhor: Pegar o innerText do mainContent.
+           const bodyText = mainContent.innerText;
+           
+           // Procura por R$ seguido de número
+           // O "Frete Grátis" geralmente está no Header. Se pegarmos o 'main', resolve.
            const match = bodyText.match(/R\$\s?(\d{1,3}(\.?\d{3})*,\d{2})/);
            if (match) price = match[0];
         }
@@ -281,7 +308,8 @@ async function scrapeProduct(rawUrl) {
         // --- IMAGEM ---
         let image = document.querySelector('meta[property="og:image"]')?.getAttribute('content') ||
                     document.querySelector('.s-image')?.src ||
-                    document.querySelector('img[data-testid="image"]')?.src || '';
+                    document.querySelector('img[data-testid="image"]')?.src || 
+                    document.querySelector('#image-main')?.src || '';
 
         return { title, price, image };
       });
@@ -292,6 +320,8 @@ async function scrapeProduct(rawUrl) {
       let formattedPrice = data.price;
       if (formattedPrice) {
           formattedPrice = String(formattedPrice).replace(/\s+/g, ' ').replace('R$', '').trim();
+          // Remove pontos de milhar se existirem errados, mas mantém vírgula decimal
+          // Ex: 1.500,00 -> ok. 
           formattedPrice = `R$ ${formattedPrice}`;
       }
 
