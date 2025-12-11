@@ -12,6 +12,10 @@ app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
+// URL do seu Backend (Necessário para gerar o deep-link)
+// Se mudar de host, atualize aqui ou use process.env.PUBLIC_URL
+const BASE_URL = "https://kero-backend1.onrender.com";
+
 const limiter = rateLimit({ windowMs: 10 * 1000, max: 30 });
 app.use(limiter);
 
@@ -23,11 +27,83 @@ const queue = new PQueue({
 // User Agent de alta confiança (Mac/Chrome)
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
 
-// ---------------- SISTEMA DE AFILIADOS (MONETIZAÇÃO) ----------------
+// ---------------- SISTEMA DE AFILIADOS (MONETIZAÇÃO AVANÇADA) ----------------
 
 /**
- * Função para aplicar tags de afiliado na URL.
- * Suporta Amazon e Mercado Livre.
+ * ROTA DE DEEP LINK (A MÁGICA DO COOKIE DROP)
+ * Essa rota cria uma página intermediária que:
+ * 1. Carrega o link Social do ML em um iframe invisível (grava cookie/sessão)
+ * 2. Redireciona o usuário para o produto com os parâmetros matt_ injetados.
+ */
+app.get("/deep-link", (req, res) => {
+  const targetUrl = req.query.url;
+  
+  if (!targetUrl) {
+    return res.redirect("https://www.mercadolivre.com.br");
+  }
+
+  // Seus dados de afiliado
+  const ML_TAG = "lo20251209171148";
+  const MATT_TOOL = "57996476";
+
+  // 1. URL Social (Para gravar o cookie)
+  const socialUrl = `https://www.mercadolivre.com.br/social/${ML_TAG}?matt_word=${ML_TAG}&matt_tool=${MATT_TOOL}`;
+
+  // 2. Preparar URL Final do Produto (Limpeza + Injeção de Parâmetros de Segurança)
+  let finalProductUrl = targetUrl;
+  try {
+      const urlObj = new URL(targetUrl);
+      
+      // Remove parâmetros sujos que podem quebrar o tracking
+      const paramsToRemove = ['click_id', 'wid', 'sid', 'c_id', 'c_uid', 'reco_id', 'reco_backend'];
+      paramsToRemove.forEach(p => urlObj.searchParams.delete(p));
+
+      // Injeta os parâmetros na URL final também (Redundância de segurança)
+      urlObj.searchParams.set('matt_tool', MATT_TOOL);
+      urlObj.searchParams.set('matt_word', ML_TAG);
+      
+      finalProductUrl = urlObj.toString();
+  } catch(e) {}
+
+  // 3. Retorna a página "Sanduíche"
+  const html = `
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Redirecionando para Mercado Livre...</title>
+        <style>
+            body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f5f5f5; }
+            .loader { border: 4px solid #f3f3f3; border-top: 4px solid #ffe600; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 20px; }
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            p { color: #666; font-size: 14px; }
+        </style>
+    </head>
+    <body>
+        <div class="loader"></div>
+        <p>Acessando oferta oficial...</p>
+        
+        <!-- O IFRAME MÁGICO: Carrega sua etiqueta social invisivelmente -->
+        <iframe src="${socialUrl}" style="display:none;width:0;height:0;border:0;"></iframe>
+
+        <script>
+            // Redireciona para o produto após 1.2 segundos (tempo para o iframe carregar o cookie)
+            setTimeout(function() {
+                window.location.replace("${finalProductUrl}");
+            }, 1200);
+        </script>
+    </body>
+    </html>
+  `;
+
+  res.send(html);
+});
+
+
+/**
+ * Função para aplicar tags de afiliado.
+ * Agora gera um link para o NOSSO backend (/deep-link) no caso do Mercado Livre.
  */
 function generateAffiliateLink(urlInput) {
   if (!urlInput) return urlInput;
@@ -40,7 +116,7 @@ function generateAffiliateLink(urlInput) {
         return urlInput;
     }
 
-    // Proteção extra: Se a URL ainda for uma página de verificação/erro, não monetiza, retorna a original
+    // Proteção: Se for página de login/erro, mantém original
     if (urlObj.href.includes('/gz/account-verification') || 
         urlObj.href.includes('/suspendida') || 
         urlObj.href.includes('/login')) {
@@ -50,42 +126,23 @@ function generateAffiliateLink(urlInput) {
     const domain = urlObj.hostname.replace('www.', '');
     
     // --- 1. AMAZON (Tag: kero0a-20) ---
+    // Amazon funciona bem com parâmetros diretos
     if (domain.includes('amazon.')) {
-      // Remove tags de concorrentes
       urlObj.searchParams.delete('tag'); 
       urlObj.searchParams.delete('ascsubtag');
-      urlObj.searchParams.delete('linkCode');
-      urlObj.searchParams.delete('ref'); // Limpa referências sujas
-      
-      // Aplica SUAS tags
       urlObj.searchParams.set('tag', 'kero0a-20');
       return urlObj.toString();
     }
 
-    // --- 2. MERCADO LIVRE (Etiqueta: lo20251209171148) ---
+    // --- 2. MERCADO LIVRE (Estratégia Deep Link / Redirect) ---
     if (domain.includes('mercadolivre.com.br') || domain.includes('mercadolibre.')) {
-       // IDs fornecidos
-       // matt_tool=57996476
-       // matt_word=lo20251209171148
-
-       // Remove lixo de rastreamento interno do ML para evitar links gigantes ou quebrados
-       const paramsToRemove = [
-           'matt_tool', 'matt_word', 'click_id', 'af_click_lookback',
-           'polycard_client', 'reco_backend', 'reco_model', 'reco_client', 
-           'reco_item_pos', 'reco_backend_type', 'reco_id', 'wid', 'sid', 
-           'c_id', 'c_uid', 'pdp_filters', 'go'
-       ];
+       // Em vez de retornar o link do ML direto, retornamos o link do nosso backend
+       // Isso força o usuário a passar pela rota /deep-link definida acima
        
-       paramsToRemove.forEach(p => urlObj.searchParams.delete(p));
-       
-       // Aplica SUAS tags
-       urlObj.searchParams.set('matt_tool', '57996476');
-       urlObj.searchParams.set('matt_word', 'lo20251209171148');
-       
-       return urlObj.toString();
+       const targetUrlEncoded = encodeURIComponent(urlInput);
+       return `${BASE_URL}/deep-link?url=${targetUrlEncoded}`;
     }
 
-    // Retorna original para outros sites
     return urlInput;
 
   } catch (error) {
@@ -126,7 +183,7 @@ async function searchWithPuppeteer(query) {
       if (mlResults.length > 0) results.push(...mlResults);
     } catch (error) {}
     
-    // 2. Amazon (se precisar)
+    // 2. Amazon
     if (results.length < 5) {
       try {
         const amazonResults = await searchAmazon(page, query);
@@ -234,7 +291,7 @@ async function scrapeProduct(rawUrl) {
       let url = rawUrl.trim();
       if (!url.startsWith('http')) url = 'https://' + url;
 
-      // Monetização inicial (pré-navegação)
+      // Monetização inicial
       let monetizedUrl = generateAffiliateLink(url);
 
       browser = await puppeteer.launch({
@@ -256,68 +313,55 @@ async function scrapeProduct(rawUrl) {
         "Upgrade-Insecure-Requests": "1"
       });
       
-      // Navega para a URL
       await page.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
 
       // --- CORREÇÃO DE URL BLOQUEADA / REDIRECIONADA ---
       const pageUrl = page.url();
       let finalUrl = pageUrl;
 
-      // Verifica se fomos bloqueados pelo Mercado Livre ou similar
+      // Verifica bloqueio
       if (pageUrl.includes('/gz/account-verification') || 
           pageUrl.includes('/login') || 
-          pageUrl.includes('/suspendida') ||
-          pageUrl.includes('recaptcha')) {
+          pageUrl.includes('/suspendida')) {
           
-          console.warn("⚠️ Bloqueio detectado na página (Verification/Login). Revertendo URL.");
-          
-          // Tenta recuperar a URL real se estiver num parâmetro de redirecionamento (comum no ML)
-          // Ex: /gz/account-verification?go=URL_REAL
           try {
               const urlObj = new URL(pageUrl);
               const goParam = urlObj.searchParams.get('go');
               if (goParam) {
                   finalUrl = decodeURIComponent(goParam);
               } else {
-                  finalUrl = url; // Fallback para a URL original enviada pelo usuário
+                  finalUrl = url;
               }
           } catch (e) {
               finalUrl = url;
           }
       }
 
-      // Regera o link monetizado baseado na URL limpa (seja a final resolvida ou a original recuperada)
+      // Regera o link monetizado com a URL final limpa
       monetizedUrl = generateAffiliateLink(finalUrl);
 
       const data = await page.evaluate(() => {
-        // --- TÍTULO ---
         let title = document.querySelector('h1')?.innerText?.trim() || 
                    document.querySelector('meta[property="og:title"]')?.getAttribute('content') ||
                    document.title;
         
-        // Remove sufixos comuns
         if (title) {
-            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee', ' | Morana'];
+            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee'];
             storeSuffixes.forEach(s => title = title.split(s)[0]);
         }
         
-        // Se estamos numa página de verificação, o título provavelmente é ruim ("Mercado Livre", "Verificação").
-        // O código do backend vai tratar isso, mas tentamos pegar o melhor possível.
         if (title.includes('Mercado Livre') && document.title.length < 20) {
-            title = ''; // Força fallback no frontend se for só o nome da loja
+            title = '';
         }
 
-        // --- PREÇO (LÓGICA BLINDADA ANTI-FRETE) ---
         let price = null;
         
-        // 0. Meta Tags
         const metaPrice = document.querySelector('meta[property="product:price:amount"]')?.getAttribute('content') ||
                           document.querySelector('meta[property="og:price:amount"]')?.getAttribute('content');
         if (metaPrice && metaPrice.match(/\d/)) {
             price = metaPrice;
         }
 
-        // 1. JSON-LD
         if (!price) {
             const scripts = document.querySelectorAll('script[type="application/ld+json"]');
             for (const script of scripts) {
@@ -336,21 +380,8 @@ async function scrapeProduct(rawUrl) {
             }
         }
 
-        // 2. Seletores Visuais
         if (!price) {
-            const priceSelectors = [
-              '.skuBestPrice',                // VTEX (Morana)
-              '.best-price',
-              '.val-best-price',
-              '.product-price', 
-              '.price', 
-              '[itemprop="price"]', 
-              '.a-price-whole',               // Amazon
-              '.andes-money-amount__fraction',// Mercado Livre
-              '[data-testid="price-value"]',  // Magalu
-              '.sales-price',
-              '.current-price'
-            ];
+            const priceSelectors = ['.a-price-whole', '.andes-money-amount__fraction', '[data-testid="price-value"]', '.price'];
             for (const sel of priceSelectors) {
                 const el = document.querySelector(sel);
                 if (el && el.innerText.match(/\d/)) {
@@ -363,32 +394,16 @@ async function scrapeProduct(rawUrl) {
                 }
             }
         }
-        
-        // 3. REGEX
-        if (!price) {
-           const mainContent = document.querySelector('main') || 
-                               document.querySelector('.product-container') || 
-                               document.querySelector('#product-content') || 
-                               document.querySelector('.vtex-store-components-3-x-productContainer') || 
-                               document.body; 
-           
-           const bodyText = mainContent.innerText;
-           const match = bodyText.match(/R\$\s?(\d{1,3}(\.?\d{3})*,\d{2})/);
-           if (match) price = match[0];
-        }
 
-        // --- IMAGEM ---
         let image = document.querySelector('meta[property="og:image"]')?.getAttribute('content') ||
                     document.querySelector('.s-image')?.src ||
-                    document.querySelector('img[data-testid="image"]')?.src || 
-                    document.querySelector('#image-main')?.src || '';
+                    document.querySelector('img[data-testid="image"]')?.src || '';
 
         return { title, price, image };
       });
 
       await browser.close();
 
-      // Limpeza do preço
       let formattedPrice = data.price;
       if (formattedPrice) {
           formattedPrice = String(formattedPrice).replace(/\s+/g, ' ').replace('R$', '').trim();
@@ -408,7 +423,6 @@ async function scrapeProduct(rawUrl) {
       console.error("Scrape Error:", error.message);
       if (browser) await browser.close();
       
-      // Mesmo com erro, retornamos o link original monetizado como fallback
       return { 
           success: false, 
           url: rawUrl, 
@@ -437,7 +451,6 @@ app.post("/scrape", async (req, res) => {
       res.json(products);
     }
   } catch (error) {
-    // Fallback de erro
     const safeUrl = req.body?.url || '';
     res.json({
         ...getFallbackProducts(safeUrl)[0],
