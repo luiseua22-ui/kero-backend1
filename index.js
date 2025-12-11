@@ -23,6 +23,66 @@ const queue = new PQueue({
 // User Agent de alta confiança (Mac/Chrome)
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
 
+// ---------------- SISTEMA DE AFILIADOS (MONETIZAÇÃO) ----------------
+
+/**
+ * Função para aplicar tags de afiliado na URL.
+ * Suporta Amazon e Mercado Livre.
+ */
+function generateAffiliateLink(urlInput) {
+  if (!urlInput) return urlInput;
+  
+  try {
+    let urlObj;
+    try {
+        urlObj = new URL(urlInput);
+    } catch (e) {
+        return urlInput;
+    }
+
+    const domain = urlObj.hostname.replace('www.', '');
+    
+    // --- 1. AMAZON (Tag: kero0a-20) ---
+    if (domain.includes('amazon.')) {
+      // Remove tags de concorrentes
+      urlObj.searchParams.delete('tag'); 
+      urlObj.searchParams.delete('ascsubtag');
+      urlObj.searchParams.delete('linkCode');
+      urlObj.searchParams.delete('ref'); // Limpa referências sujas
+      
+      // Aplica SUAS tags
+      urlObj.searchParams.set('tag', 'kero0a-20');
+      return urlObj.toString();
+    }
+
+    // --- 2. MERCADO LIVRE (Etiqueta: lo20251209171148) ---
+    if (domain.includes('mercadolivre.com.br') || domain.includes('mercadolibre.')) {
+       // IDs fornecidos
+       // matt_tool=57996476
+       // matt_word=lo20251209171148
+
+       // Remove tags de concorrentes ou antigas
+       urlObj.searchParams.delete('matt_tool');
+       urlObj.searchParams.delete('matt_word');
+       urlObj.searchParams.delete('click_id');
+       urlObj.searchParams.delete('af_click_lookback');
+       
+       // Aplica SUAS tags
+       urlObj.searchParams.set('matt_tool', '57996476');
+       urlObj.searchParams.set('matt_word', 'lo20251209171148');
+       
+       return urlObj.toString();
+    }
+
+    // Retorna original para outros sites
+    return urlInput;
+
+  } catch (error) {
+    console.error("Erro ao gerar link afiliado:", error);
+    return urlInput;
+  }
+}
+
 // ---------------- BUSCA INTELIGENTE (SEARCH) ----------------
 
 async function searchWithPuppeteer(query) {
@@ -60,14 +120,6 @@ async function searchWithPuppeteer(query) {
       try {
         const amazonResults = await searchAmazon(page, query);
         if (amazonResults.length > 0) results.push(...amazonResults);
-      } catch (error) {}
-    }
-    
-    // 3. Magazine Luiza (se precisar)
-    if (results.length < 5) {
-      try {
-        const magaluResults = await searchMagazineLuiza(page, query);
-        if (magaluResults.length > 0) results.push(...magaluResults);
       } catch (error) {}
     }
 
@@ -134,30 +186,6 @@ async function searchAmazon(page, query) {
   } catch (error) { return []; }
 }
 
-async function searchMagazineLuiza(page, query) {
-  const searchUrl = `https://www.magazineluiza.com.br/busca/${encodeURIComponent(query)}/`;
-  try {
-    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-    return await page.evaluate(() => {
-      const items = [];
-      const elements = document.querySelectorAll('[data-testid="product-card"]');
-      for (const el of elements) {
-        try {
-          const title = el.querySelector('[data-testid="product-title"]')?.textContent.trim();
-          const price = el.querySelector('[data-testid="price-value"]')?.textContent.trim();
-          const image = el.querySelector('img')?.src;
-          const link = el.querySelector('a')?.href;
-          if (title && price && link) {
-            items.push({ title, price, store: 'Magazine Luiza', imageUrl: image, link });
-          }
-        } catch(e) {}
-        if (items.length >= 6) break;
-      }
-      return items;
-    });
-  } catch (error) { return []; }
-}
-
 function removeDuplicates(products) {
   const seen = new Set();
   const unique = [];
@@ -195,6 +223,9 @@ async function scrapeProduct(rawUrl) {
       let url = rawUrl.trim();
       if (!url.startsWith('http')) url = 'https://' + url;
 
+      // Monetização inicial (pré-navegação) - útil se o puppeteer falhar
+      let monetizedUrl = generateAffiliateLink(url);
+
       browser = await puppeteer.launch({
         headless: "new",
         args: [
@@ -214,7 +245,16 @@ async function scrapeProduct(rawUrl) {
         "Upgrade-Insecure-Requests": "1"
       });
       
+      // Navega para a URL
       await page.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
+
+      // --- CRÍTICO: CAPTURA URL FINAL APÓS REDIRECIONAMENTOS ---
+      // Se o usuário colou amzn.to ou meli.la, agora temos a URL real do produto
+      const finalUrl = page.url();
+      
+      // Regera o link monetizado baseado na URL final limpa e resolvida
+      // Isso garante que sobrescrevemos tags de concorrentes escondidas em links curtos
+      monetizedUrl = generateAffiliateLink(finalUrl);
 
       const data = await page.evaluate(() => {
         // --- TÍTULO ---
@@ -231,14 +271,14 @@ async function scrapeProduct(rawUrl) {
         // --- PREÇO (LÓGICA BLINDADA ANTI-FRETE) ---
         let price = null;
         
-        // 0. Meta Tags (Muitas vezes contém o preço limpo)
+        // 0. Meta Tags
         const metaPrice = document.querySelector('meta[property="product:price:amount"]')?.getAttribute('content') ||
                           document.querySelector('meta[property="og:price:amount"]')?.getAttribute('content');
         if (metaPrice && metaPrice.match(/\d/)) {
             price = metaPrice;
         }
 
-        // 1. JSON-LD (Melhor opção técnica)
+        // 1. JSON-LD
         if (!price) {
             const scripts = document.querySelectorAll('script[type="application/ld+json"]');
             for (const script of scripts) {
@@ -257,7 +297,7 @@ async function scrapeProduct(rawUrl) {
             }
         }
 
-        // 2. Seletores Visuais Específicos (Incluindo VTEX/Morana)
+        // 2. Seletores Visuais
         if (!price) {
             const priceSelectors = [
               '.skuBestPrice',                // VTEX (Morana)
@@ -285,22 +325,15 @@ async function scrapeProduct(rawUrl) {
             }
         }
         
-        // 3. REGEX (ÚLTIMO RECURSO - RESTRITO AO CONTEÚDO PRINCIPAL)
-        // Isso impede que pegue "Frete R$ 50,00" do cabeçalho
+        // 3. REGEX
         if (!price) {
-           // Tenta encontrar o container do produto ou o main, ignorando header/nav
            const mainContent = document.querySelector('main') || 
                                document.querySelector('.product-container') || 
                                document.querySelector('#product-content') || 
-                               document.querySelector('.vtex-store-components-3-x-productContainer') || // VTEX especifico
-                               document.body; // Fallback perigoso mas necessário
-                               
-           // Se formos forçados a usar o body, tentamos pular o header cortando os primeiros 500 caracteres se o texto for muito longo? 
-           // Melhor: Pegar o innerText do mainContent.
-           const bodyText = mainContent.innerText;
+                               document.querySelector('.vtex-store-components-3-x-productContainer') || 
+                               document.body; 
            
-           // Procura por R$ seguido de número
-           // O "Frete Grátis" geralmente está no Header. Se pegarmos o 'main', resolve.
+           const bodyText = mainContent.innerText;
            const match = bodyText.match(/R\$\s?(\d{1,3}(\.?\d{3})*,\d{2})/);
            if (match) price = match[0];
         }
@@ -320,14 +353,13 @@ async function scrapeProduct(rawUrl) {
       let formattedPrice = data.price;
       if (formattedPrice) {
           formattedPrice = String(formattedPrice).replace(/\s+/g, ' ').replace('R$', '').trim();
-          // Remove pontos de milhar se existirem errados, mas mantém vírgula decimal
-          // Ex: 1.500,00 -> ok. 
           formattedPrice = `R$ ${formattedPrice}`;
       }
 
       return {
         success: true,
-        url: url,
+        url: finalUrl, // Retorna a URL final resolvida
+        monetized_url: monetizedUrl, // Retorna o link monetizado (que usa a URL final)
         title: data.title || 'Produto',
         price: formattedPrice || '', 
         image: data.image || ''
