@@ -40,6 +40,13 @@ function generateAffiliateLink(urlInput) {
         return urlInput;
     }
 
+    // Proteção extra: Se a URL ainda for uma página de verificação/erro, não monetiza, retorna a original
+    if (urlObj.href.includes('/gz/account-verification') || 
+        urlObj.href.includes('/suspendida') || 
+        urlObj.href.includes('/login')) {
+        return urlInput;
+    }
+
     const domain = urlObj.hostname.replace('www.', '');
     
     // --- 1. AMAZON (Tag: kero0a-20) ---
@@ -61,11 +68,15 @@ function generateAffiliateLink(urlInput) {
        // matt_tool=57996476
        // matt_word=lo20251209171148
 
-       // Remove tags de concorrentes ou antigas
-       urlObj.searchParams.delete('matt_tool');
-       urlObj.searchParams.delete('matt_word');
-       urlObj.searchParams.delete('click_id');
-       urlObj.searchParams.delete('af_click_lookback');
+       // Remove lixo de rastreamento interno do ML para evitar links gigantes ou quebrados
+       const paramsToRemove = [
+           'matt_tool', 'matt_word', 'click_id', 'af_click_lookback',
+           'polycard_client', 'reco_backend', 'reco_model', 'reco_client', 
+           'reco_item_pos', 'reco_backend_type', 'reco_id', 'wid', 'sid', 
+           'c_id', 'c_uid', 'pdp_filters', 'go'
+       ];
+       
+       paramsToRemove.forEach(p => urlObj.searchParams.delete(p));
        
        // Aplica SUAS tags
        urlObj.searchParams.set('matt_tool', '57996476');
@@ -223,7 +234,7 @@ async function scrapeProduct(rawUrl) {
       let url = rawUrl.trim();
       if (!url.startsWith('http')) url = 'https://' + url;
 
-      // Monetização inicial (pré-navegação) - útil se o puppeteer falhar
+      // Monetização inicial (pré-navegação)
       let monetizedUrl = generateAffiliateLink(url);
 
       browser = await puppeteer.launch({
@@ -248,12 +259,34 @@ async function scrapeProduct(rawUrl) {
       // Navega para a URL
       await page.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
 
-      // --- CRÍTICO: CAPTURA URL FINAL APÓS REDIRECIONAMENTOS ---
-      // Se o usuário colou amzn.to ou meli.la, agora temos a URL real do produto
-      const finalUrl = page.url();
-      
-      // Regera o link monetizado baseado na URL final limpa e resolvida
-      // Isso garante que sobrescrevemos tags de concorrentes escondidas em links curtos
+      // --- CORREÇÃO DE URL BLOQUEADA / REDIRECIONADA ---
+      const pageUrl = page.url();
+      let finalUrl = pageUrl;
+
+      // Verifica se fomos bloqueados pelo Mercado Livre ou similar
+      if (pageUrl.includes('/gz/account-verification') || 
+          pageUrl.includes('/login') || 
+          pageUrl.includes('/suspendida') ||
+          pageUrl.includes('recaptcha')) {
+          
+          console.warn("⚠️ Bloqueio detectado na página (Verification/Login). Revertendo URL.");
+          
+          // Tenta recuperar a URL real se estiver num parâmetro de redirecionamento (comum no ML)
+          // Ex: /gz/account-verification?go=URL_REAL
+          try {
+              const urlObj = new URL(pageUrl);
+              const goParam = urlObj.searchParams.get('go');
+              if (goParam) {
+                  finalUrl = decodeURIComponent(goParam);
+              } else {
+                  finalUrl = url; // Fallback para a URL original enviada pelo usuário
+              }
+          } catch (e) {
+              finalUrl = url;
+          }
+      }
+
+      // Regera o link monetizado baseado na URL limpa (seja a final resolvida ou a original recuperada)
       monetizedUrl = generateAffiliateLink(finalUrl);
 
       const data = await page.evaluate(() => {
@@ -266,6 +299,12 @@ async function scrapeProduct(rawUrl) {
         if (title) {
             const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee', ' | Morana'];
             storeSuffixes.forEach(s => title = title.split(s)[0]);
+        }
+        
+        // Se estamos numa página de verificação, o título provavelmente é ruim ("Mercado Livre", "Verificação").
+        // O código do backend vai tratar isso, mas tentamos pegar o melhor possível.
+        if (title.includes('Mercado Livre') && document.title.length < 20) {
+            title = ''; // Força fallback no frontend se for só o nome da loja
         }
 
         // --- PREÇO (LÓGICA BLINDADA ANTI-FRETE) ---
@@ -358,8 +397,8 @@ async function scrapeProduct(rawUrl) {
 
       return {
         success: true,
-        url: finalUrl, // Retorna a URL final resolvida
-        monetized_url: monetizedUrl, // Retorna o link monetizado (que usa a URL final)
+        url: finalUrl, 
+        monetized_url: monetizedUrl, 
         title: data.title || 'Produto',
         price: formattedPrice || '', 
         image: data.image || ''
@@ -368,7 +407,14 @@ async function scrapeProduct(rawUrl) {
     } catch (error) {
       console.error("Scrape Error:", error.message);
       if (browser) await browser.close();
-      return { success: false, url: rawUrl, error: "Erro ao ler site" };
+      
+      // Mesmo com erro, retornamos o link original monetizado como fallback
+      return { 
+          success: false, 
+          url: rawUrl, 
+          monetized_url: generateAffiliateLink(rawUrl), 
+          error: "Erro ao ler site" 
+      };
     }
   });
 }
@@ -391,7 +437,12 @@ app.post("/scrape", async (req, res) => {
       res.json(products);
     }
   } catch (error) {
-    res.json(getFallbackProducts(req.body?.url || ''));
+    // Fallback de erro
+    const safeUrl = req.body?.url || '';
+    res.json({
+        ...getFallbackProducts(safeUrl)[0],
+        monetized_url: generateAffiliateLink(safeUrl)
+    });
   }
 });
 
