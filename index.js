@@ -296,7 +296,7 @@ function getFallbackProducts(query) {
   }];
 }
 
-// ---------------- SCRAPING INDIVIDUAL (CORRIGIDO PARA MORANA E OUTROS) ----------------
+// ---------------- SCRAPING INDIVIDUAL (CORRIGIDO PARA AMAZON E OUTROS) ----------------
 
 async function scrapeProduct(rawUrl) {
   return queue.add(async () => {
@@ -357,49 +357,102 @@ async function scrapeProduct(rawUrl) {
           finalUrl = pageUrl;
       }
 
-      // Se a URL final mudou (ex: link encurtado expandido), regeramos o link monetizado para garantir
-      // que estamos apontando para o produto real com a tag correta
+      // Se a URL final mudou, regeramos o link monetizado
       if (finalUrl !== url) {
           monetizedUrl = generateAffiliateLink(finalUrl);
       }
 
       const data = await page.evaluate(() => {
-        let title = document.querySelector('h1')?.innerText?.trim() || 
-                   document.querySelector('meta[property="og:title"]')?.getAttribute('content') ||
-                   document.title;
+        let title = '';
+        let price = null;
+        let image = '';
+
+        // 1. TENTATIVA VIA JSON-LD (DADOS ESTRUTURADOS) - MAIS CONFIÁVEL PARA AMAZON
+        const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+        for (const script of scripts) {
+            try {
+                const json = JSON.parse(script.innerText);
+                
+                // Formato padrão Product
+                if (json['@type'] === 'Product') {
+                    if (json.name) title = json.name;
+                    if (json.image) {
+                        image = Array.isArray(json.image) ? json.image[0] : json.image;
+                    }
+                    if (json.offers) {
+                        const offer = Array.isArray(json.offers) ? json.offers[0] : json.offers;
+                        if (offer.price) price = offer.price;
+                        if (offer.lowPrice) price = offer.lowPrice;
+                    }
+                }
+                
+                // Formato Graph
+                if (json['@graph']) {
+                    const p = json['@graph'].find(i => i['@type'] === 'Product');
+                    if (p) {
+                        if (p.name) title = p.name;
+                        if (p.image) image = p.image;
+                        if (p.offers && p.offers.price) price = p.offers.price;
+                    }
+                }
+                
+                // Se achou tudo, para.
+                if (title && price && image) break;
+            } catch(e) {}
+        }
+
+        // 2. SELETORES ESPECÍFICOS AMAZON (Se JSON-LD falhou)
+        if (window.location.hostname.includes('amazon')) {
+            if (!title) {
+                // IDs clássicos da Amazon
+                const amzTitle = document.getElementById('productTitle')?.innerText?.trim();
+                if (amzTitle) title = amzTitle;
+            }
+
+            if (!image) {
+                // IDs de imagem da Amazon (LandingImage é o principal, imgBlkFront é livros)
+                const amzImg = document.getElementById('landingImage')?.src ||
+                               document.getElementById('imgBlkFront')?.src ||
+                               document.querySelector('#imgTagWrapperId img')?.src ||
+                               document.querySelector('.a-dynamic-image')?.src;
+                
+                // Tenta pegar do atributo data-a-dynamic-image se existir (JSON dentro de atributo)
+                if (!amzImg) {
+                    const dynamicContainer = document.getElementById('landingImage') || document.getElementById('imgBlkFront');
+                    if (dynamicContainer) {
+                        const dataDynamic = dynamicContainer.getAttribute('data-a-dynamic-image');
+                        if (dataDynamic) {
+                            try {
+                                const urls = Object.keys(JSON.parse(dataDynamic));
+                                if (urls.length > 0) image = urls[0];
+                            } catch(e){}
+                        }
+                    }
+                }
+
+                if (amzImg) image = amzImg;
+            }
+        }
+
+        // 3. FALLBACK GENÉRICO (OUTROS SITES)
+        if (!title) {
+            title = document.querySelector('h1')?.innerText?.trim() || 
+                    document.querySelector('meta[property="og:title"]')?.getAttribute('content') ||
+                    document.title;
+        }
         
+        // Limpeza de título
         if (title) {
             const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee'];
             storeSuffixes.forEach(s => title = title.split(s)[0]);
-        }
-        
-        if (title.includes('Mercado Livre') && document.title.length < 20) {
-            title = '';
-        }
-
-        let price = null;
-        
-        const metaPrice = document.querySelector('meta[property="product:price:amount"]')?.getAttribute('content') ||
-                          document.querySelector('meta[property="og:price:amount"]')?.getAttribute('content');
-        if (metaPrice && metaPrice.match(/\d/)) {
-            price = metaPrice;
+            if (title.includes('Mercado Livre') && document.title.length < 20) title = '';
         }
 
         if (!price) {
-            const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-            for (const script of scripts) {
-                try {
-                    const json = JSON.parse(script.innerText);
-                    if (json['@type'] === 'Product' && json.offers) {
-                        const offer = Array.isArray(json.offers) ? json.offers[0] : json.offers;
-                        if (offer.price) { price = offer.price; break; }
-                        if (offer.lowPrice) { price = offer.lowPrice; break; }
-                    }
-                    if (json['@graph']) {
-                        const p = json['@graph'].find(i => i['@type'] === 'Product');
-                        if (p?.offers?.price) { price = p.offers.price; break; }
-                    }
-                } catch(e) {}
+            const metaPrice = document.querySelector('meta[property="product:price:amount"]')?.getAttribute('content') ||
+                              document.querySelector('meta[property="og:price:amount"]')?.getAttribute('content');
+            if (metaPrice && metaPrice.match(/\d/)) {
+                price = metaPrice;
             }
         }
 
@@ -418,9 +471,11 @@ async function scrapeProduct(rawUrl) {
             }
         }
 
-        let image = document.querySelector('meta[property="og:image"]')?.getAttribute('content') ||
+        if (!image) {
+            image = document.querySelector('meta[property="og:image"]')?.getAttribute('content') ||
                     document.querySelector('.s-image')?.src ||
                     document.querySelector('img[data-testid="image"]')?.src || '';
+        }
 
         return { title, price, image };
       });
@@ -435,8 +490,8 @@ async function scrapeProduct(rawUrl) {
 
       return {
         success: true,
-        url: finalUrl, // URL real do produto (para display)
-        monetized_url: monetizedUrl, // URL segura que passa pelo nosso proxy
+        url: finalUrl,
+        monetized_url: monetizedUrl,
         title: data.title || 'Produto',
         price: formattedPrice || '', 
         image: data.image || ''
@@ -446,7 +501,6 @@ async function scrapeProduct(rawUrl) {
       console.error("Scrape Error:", error.message);
       if (browser) await browser.close();
       
-      // Mesmo com erro de leitura, garantimos o link monetizado
       return { 
           success: false, 
           url: rawUrl, 
