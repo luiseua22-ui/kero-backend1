@@ -18,22 +18,24 @@ const BASE_URL = "https://kero-backend1.onrender.com";
 const limiter = rateLimit({ windowMs: 10 * 1000, max: 30 });
 app.use(limiter);
 
+// Aumentando concorrência levemente pois agora o scraper é mais leve
+// Mas mantendo segurança para não estourar a RAM do Render Free Tier
 const queue = new PQueue({ 
-  concurrency: Number(process.env.SCRAPE_CONCURRENCY) || 1,
-  timeout: 60000 
+  concurrency: Number(process.env.SCRAPE_CONCURRENCY) || 2,
+  timeout: 45000 // Timeout reduzido para falhar mais rápido e liberar fila
 });
 
-// User Agent de alta confiança (Mac/Chrome)
-const DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
+// Lista rotativa de User Agents para evitar detecção simples
+const USER_AGENTS = [
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+];
+
+const getRandomUserAgent = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
 // ---------------- SISTEMA DE AFILIADOS (MONETIZAÇÃO BLINDADA) ----------------
 
-/**
- * ROTA DE DEEP LINK E REDIRECIONAMENTO SEGURO
- * 
- * Para Mercado Livre: Usa "Cookie Drop" via Iframe (Atribuição Social).
- * Para Amazon: Usa HTTP 302 Redirect (Atribuição Técnica via Server-Side).
- */
 app.get("/deep-link", (req, res) => {
   const targetUrl = req.query.url;
   
@@ -48,32 +50,25 @@ app.get("/deep-link", (req, res) => {
       return res.redirect(targetUrl);
   }
 
-  // --- ESTRATÉGIA AMAZON (LAYER 1 & 2: CONSTRUÇÃO + 302 REDIRECT) ---
+  // --- ESTRATÉGIA AMAZON ---
   if (domain.includes("amazon")) {
       try {
           const urlObj = new URL(targetUrl);
-          
-          // 1. LIMPEZA TOTAL (Remove tags de concorrentes e lixo)
           const paramsToRemove = [
               'tag', 'ascsubtag', 'linkCode', 'ref', 'ref_', 'pf_rd_r', 'pf_rd_p', 
               'pf_rd_m', 'pf_rd_s', 'pf_rd_t', 'scm', 'sr', 'qid', 'keywords'
           ];
           paramsToRemove.forEach(p => urlObj.searchParams.delete(p));
 
-          // 2. INJEÇÃO DA SUA TAG
           urlObj.searchParams.set('tag', 'kero0a-20');
-
-          // 3. INJEÇÃO DE SUBTAG DE RASTREAMENTO (Unique Click ID)
-          // Formato: kero_timestamp_random
           const uniqueClickId = `kero_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
           urlObj.searchParams.set('ascsubtag', uniqueClickId);
 
-          // 4. REDIRECIONAMENTO 302 (Muda a URL no navegador mantendo a atribuição)
           return res.redirect(302, urlObj.toString());
 
       } catch (e) {
           console.error("Erro ao processar link Amazon:", e);
-          return res.redirect(targetUrl); // Fallback
+          return res.redirect(targetUrl);
       }
   }
 
@@ -82,22 +77,17 @@ app.get("/deep-link", (req, res) => {
       const ML_TAG = "lo20251209171148";
       const MATT_TOOL = "57996476";
 
-      // Link social para gravar cookie
       const socialUrl = `https://www.mercadolivre.com.br/social/${ML_TAG}?matt_word=${ML_TAG}&matt_tool=${MATT_TOOL}`;
 
-      // Link final do produto com reforço de parâmetros
       let finalProductUrl = targetUrl;
       try {
           const urlObj = new URL(targetUrl);
-          // Remove tracking sujo
           ['click_id', 'wid', 'sid', 'c_id', 'c_uid', 'reco_id', 'reco_backend'].forEach(p => urlObj.searchParams.delete(p));
-          // Reforço
           urlObj.searchParams.set('matt_tool', MATT_TOOL);
           urlObj.searchParams.set('matt_word', ML_TAG);
           finalProductUrl = urlObj.toString();
       } catch(e) {}
 
-      // Página Sanduíche
       const html = `
         <!DOCTYPE html>
         <html lang="pt-BR">
@@ -117,7 +107,7 @@ app.get("/deep-link", (req, res) => {
             <p>Acessando oferta...</p>
             <iframe src="${socialUrl}" style="display:none;width:0;height:0;border:0;"></iframe>
             <script>
-                setTimeout(function() { window.location.replace("${finalProductUrl}"); }, 1000);
+                setTimeout(function() { window.location.replace("${finalProductUrl}"); }, 800);
             </script>
         </body>
         </html>
@@ -125,28 +115,16 @@ app.get("/deep-link", (req, res) => {
       return res.send(html);
   }
 
-  // Fallback padrão para outros domínios
   return res.redirect(targetUrl);
 });
 
 
-/**
- * Gerador de Links
- * Agora força TODOS os links de Amazon e Mercado Livre a passarem pelo 
- * nosso proxy (/deep-link) para garantir a aplicação da Camada 2.
- */
 function generateAffiliateLink(urlInput) {
   if (!urlInput) return urlInput;
-  
   try {
     let urlObj;
-    try {
-        urlObj = new URL(urlInput);
-    } catch (e) {
-        return urlInput;
-    }
+    try { urlObj = new URL(urlInput); } catch (e) { return urlInput; }
 
-    // Proteção contra loops ou páginas de sistema
     if (urlObj.href.includes('/gz/account-verification') || 
         urlObj.href.includes('/suspendida') || 
         urlObj.href.includes('/login')) {
@@ -154,54 +132,55 @@ function generateAffiliateLink(urlInput) {
     }
 
     const domain = urlObj.hostname;
-    
-    // Se for Amazon ou ML, gera o link proxy
     if (domain.includes('amazon') || domain.includes('mercadolivre') || domain.includes('mercadolibre')) {
        const targetUrlEncoded = encodeURIComponent(urlInput);
        return `${BASE_URL}/deep-link?url=${targetUrlEncoded}`;
     }
-
     return urlInput;
-
   } catch (error) {
-    console.error("Erro ao gerar link afiliado:", error);
     return urlInput;
   }
 }
 
-// ---------------- BUSCA INTELIGENTE (SEARCH) ----------------
+// ---------------- FUNÇÃO AUXILIAR: BLOCK RESOURCES ----------------
+// Isso é CRÍTICO para escalar. Impede o download de imagens e fontes pesadas.
+async function configurePageOptimization(page) {
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+        const resourceType = req.resourceType();
+        if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+            req.abort();
+        } else {
+            req.continue();
+        }
+    });
+}
+
+// ---------------- BUSCA (SEARCH) ----------------
 
 async function searchWithPuppeteer(query) {
   const browser = await puppeteer.launch({
     headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--window-size=1366,768"
-    ],
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--window-size=1366,768", "--disable-gpu"],
   });
 
-  const page = await browser.newPage();
-  
   try {
-    await page.setUserAgent(DEFAULT_USER_AGENT);
+    const page = await browser.newPage();
+    await configurePageOptimization(page); // Otimização ativada
+    
+    await page.setUserAgent(getRandomUserAgent());
     await page.setExtraHTTPHeaders({
       "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-      "sec-ch-ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-      "sec-ch-ua-platform": '"macOS"',
       "Upgrade-Insecure-Requests": "1"
     });
 
     const results = [];
     
-    // 1. Mercado Livre
     try {
       const mlResults = await searchMercadoLivre(page, query);
       if (mlResults.length > 0) results.push(...mlResults);
     } catch (error) {}
     
-    // 2. Amazon
     if (results.length < 5) {
       try {
         const amazonResults = await searchAmazon(page, query);
@@ -210,9 +189,7 @@ async function searchWithPuppeteer(query) {
     }
 
     const uniqueResults = removeDuplicates(results).slice(0, 15);
-    
     if (uniqueResults.length === 0) return getFallbackProducts(query);
-    
     return uniqueResults;
 
   } catch (error) {
@@ -226,7 +203,7 @@ async function searchWithPuppeteer(query) {
 async function searchMercadoLivre(page, query) {
   const searchUrl = `https://lista.mercadolivre.com.br/${encodeURIComponent(query.replace(/\s+/g, '-'))}`;
   try {
-    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 10000 });
     return await page.evaluate(() => {
       const items = [];
       const productElements = document.querySelectorAll('.ui-search-layout__item, .andes-card, [data-testid="product-card"]');
@@ -234,7 +211,8 @@ async function searchMercadoLivre(page, query) {
         try {
           const title = element.querySelector('.ui-search-item__title, h2')?.textContent.trim();
           const price = element.querySelector('.andes-money-amount__fraction, .ui-search-price__part')?.textContent.trim();
-          const image = element.querySelector('img')?.getAttribute('src');
+          // Imagens podem estar em data-src devido ao lazy load, mas como bloqueamos imagens, pegamos o atributo src mesmo que quebrado visualmente o link existe no DOM
+          let image = element.querySelector('img')?.getAttribute('src') || element.querySelector('img')?.getAttribute('data-src');
           const link = element.querySelector('a')?.href.split('?')[0];
           
           if (title && price && link) {
@@ -251,7 +229,7 @@ async function searchMercadoLivre(page, query) {
 async function searchAmazon(page, query) {
   const searchUrl = `https://www.amazon.com.br/s?k=${encodeURIComponent(query)}`;
   try {
-    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 10000 });
     return await page.evaluate(() => {
       const items = [];
       const elements = document.querySelectorAll('[data-component-type="s-search-result"]');
@@ -296,7 +274,7 @@ function getFallbackProducts(query) {
   }];
 }
 
-// ---------------- SCRAPING INDIVIDUAL (CORRIGIDO PARA AMAZON E OUTROS) ----------------
+// ---------------- SCRAPING INDIVIDUAL ----------------
 
 async function scrapeProduct(rawUrl) {
   return queue.add(async () => {
@@ -309,55 +287,38 @@ async function scrapeProduct(rawUrl) {
       let url = rawUrl.trim();
       if (!url.startsWith('http')) url = 'https://' + url;
 
-      // Gera o link seguro (deep-link) imediatamente
       let monetizedUrl = generateAffiliateLink(url);
 
       browser = await puppeteer.launch({
         headless: "new",
-        args: [
-          "--no-sandbox", 
-          "--disable-setuid-sandbox", 
-          "--window-size=1920,1080"
-        ]
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"]
       });
 
       const page = await browser.newPage();
-      
-      await page.setUserAgent(DEFAULT_USER_AGENT);
+      await configurePageOptimization(page); // Otimização ativada
+
+      await page.setUserAgent(getRandomUserAgent());
       await page.setExtraHTTPHeaders({ 
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
         "Upgrade-Insecure-Requests": "1"
       });
       
-      await page.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
+      // Timeout reduzido para 20s para liberar recursos rápido se o site for lento
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
 
-      // --- CORREÇÃO DE URL BLOQUEADA / REDIRECIONADA ---
       const pageUrl = page.url();
       let finalUrl = pageUrl;
 
-      // Verifica bloqueio do ML
       if (pageUrl.includes('/gz/account-verification') || 
           pageUrl.includes('/login') || 
           pageUrl.includes('/suspendida')) {
-          
           try {
               const urlObj = new URL(pageUrl);
               const goParam = urlObj.searchParams.get('go');
-              if (goParam) {
-                  finalUrl = decodeURIComponent(goParam);
-              } else {
-                  finalUrl = url;
-              }
-          } catch (e) {
-              finalUrl = url;
-          }
-      } else {
-          // Se não foi bloqueado, usamos a URL resolvida (útil para links encurtados da Amazon amzn.to -> amazon.com.br)
-          finalUrl = pageUrl;
+              finalUrl = goParam ? decodeURIComponent(goParam) : url;
+          } catch (e) { finalUrl = url; }
       }
 
-      // Se a URL final mudou, regeramos o link monetizado
       if (finalUrl !== url) {
           monetizedUrl = generateAffiliateLink(finalUrl);
       }
@@ -367,93 +328,39 @@ async function scrapeProduct(rawUrl) {
         let price = null;
         let image = '';
 
-        // 1. TENTATIVA VIA JSON-LD (DADOS ESTRUTURADOS) - MAIS CONFIÁVEL PARA AMAZON
+        // JSON-LD (Prioridade)
         const scripts = document.querySelectorAll('script[type="application/ld+json"]');
         for (const script of scripts) {
             try {
                 const json = JSON.parse(script.innerText);
-                
-                // Formato padrão Product
                 if (json['@type'] === 'Product') {
                     if (json.name) title = json.name;
-                    if (json.image) {
-                        image = Array.isArray(json.image) ? json.image[0] : json.image;
-                    }
+                    if (json.image) image = Array.isArray(json.image) ? json.image[0] : json.image;
                     if (json.offers) {
                         const offer = Array.isArray(json.offers) ? json.offers[0] : json.offers;
                         if (offer.price) price = offer.price;
                         if (offer.lowPrice) price = offer.lowPrice;
                     }
                 }
-                
-                // Formato Graph
-                if (json['@graph']) {
-                    const p = json['@graph'].find(i => i['@type'] === 'Product');
-                    if (p) {
-                        if (p.name) title = p.name;
-                        if (p.image) image = p.image;
-                        if (p.offers && p.offers.price) price = p.offers.price;
-                    }
-                }
-                
-                // Se achou tudo, para.
                 if (title && price && image) break;
             } catch(e) {}
         }
 
-        // 2. SELETORES ESPECÍFICOS AMAZON (Se JSON-LD falhou)
-        if (window.location.hostname.includes('amazon')) {
-            if (!title) {
-                // IDs clássicos da Amazon
-                const amzTitle = document.getElementById('productTitle')?.innerText?.trim();
-                if (amzTitle) title = amzTitle;
-            }
+        // Seletores Visuais
+        if (!title) title = document.getElementById('productTitle')?.innerText?.trim();
+        if (!title) title = document.querySelector('h1')?.innerText?.trim();
 
-            if (!image) {
-                // IDs de imagem da Amazon (LandingImage é o principal, imgBlkFront é livros)
-                const amzImg = document.getElementById('landingImage')?.src ||
-                               document.getElementById('imgBlkFront')?.src ||
-                               document.querySelector('#imgTagWrapperId img')?.src ||
-                               document.querySelector('.a-dynamic-image')?.src;
-                
-                // Tenta pegar do atributo data-a-dynamic-image se existir (JSON dentro de atributo)
-                if (!amzImg) {
-                    const dynamicContainer = document.getElementById('landingImage') || document.getElementById('imgBlkFront');
-                    if (dynamicContainer) {
-                        const dataDynamic = dynamicContainer.getAttribute('data-a-dynamic-image');
-                        if (dataDynamic) {
-                            try {
-                                const urls = Object.keys(JSON.parse(dataDynamic));
-                                if (urls.length > 0) image = urls[0];
-                            } catch(e){}
-                        }
-                    }
-                }
-
-                if (amzImg) image = amzImg;
-            }
+        if (!image && window.location.hostname.includes('amazon')) {
+             const amzImg = document.getElementById('landingImage')?.src ||
+                            document.getElementById('imgBlkFront')?.src ||
+                            document.querySelector('.a-dynamic-image')?.src;
+             // Recupera imagem mesmo se bloqueada pelo request interception (o src ainda está no DOM)
+             if (amzImg) image = amzImg;
         }
 
-        // 3. FALLBACK GENÉRICO (OUTROS SITES)
-        if (!title) {
-            title = document.querySelector('h1')?.innerText?.trim() || 
-                    document.querySelector('meta[property="og:title"]')?.getAttribute('content') ||
-                    document.title;
-        }
-        
-        // Limpeza de título
-        if (title) {
-            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee'];
-            storeSuffixes.forEach(s => title = title.split(s)[0]);
-            if (title.includes('Mercado Livre') && document.title.length < 20) title = '';
-        }
-
-        if (!price) {
-            const metaPrice = document.querySelector('meta[property="product:price:amount"]')?.getAttribute('content') ||
-                              document.querySelector('meta[property="og:price:amount"]')?.getAttribute('content');
-            if (metaPrice && metaPrice.match(/\d/)) {
-                price = metaPrice;
-            }
+        if (!image) {
+             image = document.querySelector('meta[property="og:image"]')?.getAttribute('content') ||
+                     document.querySelector('.s-image')?.src;
         }
 
         if (!price) {
@@ -469,12 +376,6 @@ async function scrapeProduct(rawUrl) {
                     break;
                 }
             }
-        }
-
-        if (!image) {
-            image = document.querySelector('meta[property="og:image"]')?.getAttribute('content') ||
-                    document.querySelector('.s-image')?.src ||
-                    document.querySelector('img[data-testid="image"]')?.src || '';
         }
 
         return { title, price, image };
@@ -513,7 +414,7 @@ async function scrapeProduct(rawUrl) {
 
 // ---------------- ROTAS ----------------
 
-app.get("/healthz", (req, res) => res.json({ ok: true }));
+app.get("/healthz", (req, res) => res.json({ ok: true, memory: process.memoryUsage() }));
 
 app.post("/scrape", async (req, res) => {
   try {
