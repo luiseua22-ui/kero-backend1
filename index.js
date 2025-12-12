@@ -13,7 +13,6 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 // URL do seu Backend (Necessário para gerar o deep-link)
-// Se mudar de host, atualize aqui ou use process.env.PUBLIC_URL
 const BASE_URL = "https://kero-backend1.onrender.com";
 
 const limiter = rateLimit({ windowMs: 10 * 1000, max: 30 });
@@ -27,83 +26,114 @@ const queue = new PQueue({
 // User Agent de alta confiança (Mac/Chrome)
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
 
-// ---------------- SISTEMA DE AFILIADOS (MONETIZAÇÃO AVANÇADA) ----------------
+// ---------------- SISTEMA DE AFILIADOS (MONETIZAÇÃO BLINDADA) ----------------
 
 /**
- * ROTA DE DEEP LINK (A MÁGICA DO COOKIE DROP)
- * Essa rota cria uma página intermediária que:
- * 1. Carrega o link Social do ML em um iframe invisível (grava cookie/sessão)
- * 2. Redireciona o usuário para o produto com os parâmetros matt_ injetados.
+ * ROTA DE DEEP LINK E REDIRECIONAMENTO SEGURO
+ * 
+ * Para Mercado Livre: Usa "Cookie Drop" via Iframe (Atribuição Social).
+ * Para Amazon: Usa HTTP 302 Redirect (Atribuição Técnica via Server-Side).
  */
 app.get("/deep-link", (req, res) => {
   const targetUrl = req.query.url;
   
   if (!targetUrl) {
-    return res.redirect("https://www.mercadolivre.com.br");
+    return res.redirect("https://www.google.com");
   }
 
-  // Seus dados de afiliado
-  const ML_TAG = "lo20251209171148";
-  const MATT_TOOL = "57996476";
-
-  // 1. URL Social (Para gravar o cookie)
-  const socialUrl = `https://www.mercadolivre.com.br/social/${ML_TAG}?matt_word=${ML_TAG}&matt_tool=${MATT_TOOL}`;
-
-  // 2. Preparar URL Final do Produto (Limpeza + Injeção de Parâmetros de Segurança)
-  let finalProductUrl = targetUrl;
+  let domain = "";
   try {
-      const urlObj = new URL(targetUrl);
-      
-      // Remove parâmetros sujos que podem quebrar o tracking
-      const paramsToRemove = ['click_id', 'wid', 'sid', 'c_id', 'c_uid', 'reco_id', 'reco_backend'];
-      paramsToRemove.forEach(p => urlObj.searchParams.delete(p));
+      domain = new URL(targetUrl).hostname;
+  } catch (e) {
+      return res.redirect(targetUrl);
+  }
 
-      // Injeta os parâmetros na URL final também (Redundância de segurança)
-      urlObj.searchParams.set('matt_tool', MATT_TOOL);
-      urlObj.searchParams.set('matt_word', ML_TAG);
-      
-      finalProductUrl = urlObj.toString();
-  } catch(e) {}
+  // --- ESTRATÉGIA AMAZON (LAYER 1 & 2: CONSTRUÇÃO + 302 REDIRECT) ---
+  if (domain.includes("amazon")) {
+      try {
+          const urlObj = new URL(targetUrl);
+          
+          // 1. LIMPEZA TOTAL (Remove tags de concorrentes e lixo)
+          const paramsToRemove = [
+              'tag', 'ascsubtag', 'linkCode', 'ref', 'ref_', 'pf_rd_r', 'pf_rd_p', 
+              'pf_rd_m', 'pf_rd_s', 'pf_rd_t', 'scm', 'sr', 'qid', 'keywords'
+          ];
+          paramsToRemove.forEach(p => urlObj.searchParams.delete(p));
 
-  // 3. Retorna a página "Sanduíche"
-  const html = `
-    <!DOCTYPE html>
-    <html lang="pt-BR">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Redirecionando para Mercado Livre...</title>
-        <style>
-            body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f5f5f5; }
-            .loader { border: 4px solid #f3f3f3; border-top: 4px solid #ffe600; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 20px; }
-            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-            p { color: #666; font-size: 14px; }
-        </style>
-    </head>
-    <body>
-        <div class="loader"></div>
-        <p>Acessando oferta oficial...</p>
-        
-        <!-- O IFRAME MÁGICO: Carrega sua etiqueta social invisivelmente -->
-        <iframe src="${socialUrl}" style="display:none;width:0;height:0;border:0;"></iframe>
+          // 2. INJEÇÃO DA SUA TAG
+          urlObj.searchParams.set('tag', 'kero0a-20');
 
-        <script>
-            // Redireciona para o produto após 1.2 segundos (tempo para o iframe carregar o cookie)
-            setTimeout(function() {
-                window.location.replace("${finalProductUrl}");
-            }, 1200);
-        </script>
-    </body>
-    </html>
-  `;
+          // 3. INJEÇÃO DE SUBTAG DE RASTREAMENTO (Unique Click ID)
+          // Formato: kero_timestamp_random
+          const uniqueClickId = `kero_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+          urlObj.searchParams.set('ascsubtag', uniqueClickId);
 
-  res.send(html);
+          // 4. REDIRECIONAMENTO 302 (Muda a URL no navegador mantendo a atribuição)
+          return res.redirect(302, urlObj.toString());
+
+      } catch (e) {
+          console.error("Erro ao processar link Amazon:", e);
+          return res.redirect(targetUrl); // Fallback
+      }
+  }
+
+  // --- ESTRATÉGIA MERCADO LIVRE (COOKIE DROP) ---
+  if (domain.includes("mercadolivre") || domain.includes("mercadolibre")) {
+      const ML_TAG = "lo20251209171148";
+      const MATT_TOOL = "57996476";
+
+      // Link social para gravar cookie
+      const socialUrl = `https://www.mercadolivre.com.br/social/${ML_TAG}?matt_word=${ML_TAG}&matt_tool=${MATT_TOOL}`;
+
+      // Link final do produto com reforço de parâmetros
+      let finalProductUrl = targetUrl;
+      try {
+          const urlObj = new URL(targetUrl);
+          // Remove tracking sujo
+          ['click_id', 'wid', 'sid', 'c_id', 'c_uid', 'reco_id', 'reco_backend'].forEach(p => urlObj.searchParams.delete(p));
+          // Reforço
+          urlObj.searchParams.set('matt_tool', MATT_TOOL);
+          urlObj.searchParams.set('matt_word', ML_TAG);
+          finalProductUrl = urlObj.toString();
+      } catch(e) {}
+
+      // Página Sanduíche
+      const html = `
+        <!DOCTYPE html>
+        <html lang="pt-BR">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Redirecionando...</title>
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #fff; }
+                .loader { border: 3px solid #f3f3f3; border-top: 3px solid #2d3277; border-radius: 50%; width: 24px; height: 24px; animation: spin 0.8s linear infinite; margin-bottom: 16px; }
+                @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                p { color: #888; font-size: 14px; }
+            </style>
+        </head>
+        <body>
+            <div class="loader"></div>
+            <p>Acessando oferta...</p>
+            <iframe src="${socialUrl}" style="display:none;width:0;height:0;border:0;"></iframe>
+            <script>
+                setTimeout(function() { window.location.replace("${finalProductUrl}"); }, 1000);
+            </script>
+        </body>
+        </html>
+      `;
+      return res.send(html);
+  }
+
+  // Fallback padrão para outros domínios
+  return res.redirect(targetUrl);
 });
 
 
 /**
- * Função para aplicar tags de afiliado.
- * Agora gera um link para o NOSSO backend (/deep-link) no caso do Mercado Livre.
+ * Gerador de Links
+ * Agora força TODOS os links de Amazon e Mercado Livre a passarem pelo 
+ * nosso proxy (/deep-link) para garantir a aplicação da Camada 2.
  */
 function generateAffiliateLink(urlInput) {
   if (!urlInput) return urlInput;
@@ -116,29 +146,17 @@ function generateAffiliateLink(urlInput) {
         return urlInput;
     }
 
-    // Proteção: Se for página de login/erro, mantém original
+    // Proteção contra loops ou páginas de sistema
     if (urlObj.href.includes('/gz/account-verification') || 
         urlObj.href.includes('/suspendida') || 
         urlObj.href.includes('/login')) {
         return urlInput;
     }
 
-    const domain = urlObj.hostname.replace('www.', '');
+    const domain = urlObj.hostname;
     
-    // --- 1. AMAZON (Tag: kero0a-20) ---
-    // Amazon funciona bem com parâmetros diretos
-    if (domain.includes('amazon.')) {
-      urlObj.searchParams.delete('tag'); 
-      urlObj.searchParams.delete('ascsubtag');
-      urlObj.searchParams.set('tag', 'kero0a-20');
-      return urlObj.toString();
-    }
-
-    // --- 2. MERCADO LIVRE (Estratégia Deep Link / Redirect) ---
-    if (domain.includes('mercadolivre.com.br') || domain.includes('mercadolibre.')) {
-       // Em vez de retornar o link do ML direto, retornamos o link do nosso backend
-       // Isso força o usuário a passar pela rota /deep-link definida acima
-       
+    // Se for Amazon ou ML, gera o link proxy
+    if (domain.includes('amazon') || domain.includes('mercadolivre') || domain.includes('mercadolibre')) {
        const targetUrlEncoded = encodeURIComponent(urlInput);
        return `${BASE_URL}/deep-link?url=${targetUrlEncoded}`;
     }
@@ -291,7 +309,7 @@ async function scrapeProduct(rawUrl) {
       let url = rawUrl.trim();
       if (!url.startsWith('http')) url = 'https://' + url;
 
-      // Monetização inicial
+      // Gera o link seguro (deep-link) imediatamente
       let monetizedUrl = generateAffiliateLink(url);
 
       browser = await puppeteer.launch({
@@ -305,7 +323,6 @@ async function scrapeProduct(rawUrl) {
 
       const page = await browser.newPage();
       
-      // HEADERS ROBUSTOS
       await page.setUserAgent(DEFAULT_USER_AGENT);
       await page.setExtraHTTPHeaders({ 
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -319,7 +336,7 @@ async function scrapeProduct(rawUrl) {
       const pageUrl = page.url();
       let finalUrl = pageUrl;
 
-      // Verifica bloqueio
+      // Verifica bloqueio do ML
       if (pageUrl.includes('/gz/account-verification') || 
           pageUrl.includes('/login') || 
           pageUrl.includes('/suspendida')) {
@@ -335,10 +352,16 @@ async function scrapeProduct(rawUrl) {
           } catch (e) {
               finalUrl = url;
           }
+      } else {
+          // Se não foi bloqueado, usamos a URL resolvida (útil para links encurtados da Amazon amzn.to -> amazon.com.br)
+          finalUrl = pageUrl;
       }
 
-      // Regera o link monetizado com a URL final limpa
-      monetizedUrl = generateAffiliateLink(finalUrl);
+      // Se a URL final mudou (ex: link encurtado expandido), regeramos o link monetizado para garantir
+      // que estamos apontando para o produto real com a tag correta
+      if (finalUrl !== url) {
+          monetizedUrl = generateAffiliateLink(finalUrl);
+      }
 
       const data = await page.evaluate(() => {
         let title = document.querySelector('h1')?.innerText?.trim() || 
@@ -412,8 +435,8 @@ async function scrapeProduct(rawUrl) {
 
       return {
         success: true,
-        url: finalUrl, 
-        monetized_url: monetizedUrl, 
+        url: finalUrl, // URL real do produto (para display)
+        monetized_url: monetizedUrl, // URL segura que passa pelo nosso proxy
         title: data.title || 'Produto',
         price: formattedPrice || '', 
         image: data.image || ''
@@ -423,6 +446,7 @@ async function scrapeProduct(rawUrl) {
       console.error("Scrape Error:", error.message);
       if (browser) await browser.close();
       
+      // Mesmo com erro de leitura, garantimos o link monetizado
       return { 
           success: false, 
           url: rawUrl, 
