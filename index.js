@@ -401,6 +401,28 @@ async function scrapeProduct(rawUrl) {
             } catch(e) {}
         }
 
+        // 1.5. SELETORES ESPECÍFICOS ALIEXPRESS
+        if (window.location.hostname.includes('aliexpress')) {
+            // Título
+            const aliTitle = document.querySelector('h1[data-pl="product-title"]')?.innerText || 
+                             document.querySelector('.product-title-text')?.innerText ||
+                             document.querySelector('h1')?.innerText;
+            if (aliTitle) title = aliTitle;
+
+            // Preço
+            const aliPrice = document.querySelector('.product-price-value')?.innerText || // Mobile/App view sometimes
+                             document.querySelector('.current-price-text')?.innerText || // Old Desktop
+                             document.querySelector('.price--currentPriceText--V8_y_b5')?.innerText || // New Dynamic
+                             document.querySelector('[class*="price--currentPriceText"]')?.innerText; // Regex style class match
+            
+            if (aliPrice) price = aliPrice;
+            
+            // Imagem - tentar garantir a melhor
+            const aliImg = document.querySelector('.pdp-main-image img')?.src ||
+                           document.querySelector('.magnifier-image')?.src;
+            if (aliImg) image = aliImg;
+        }
+
         // 2. SELETORES ESPECÍFICOS AMAZON (Se JSON-LD falhou)
         if (window.location.hostname.includes('amazon')) {
             if (!title) {
@@ -443,9 +465,16 @@ async function scrapeProduct(rawUrl) {
         
         // Limpeza de título
         if (title) {
-            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee'];
+            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee', ' | AliExpress'];
             storeSuffixes.forEach(s => title = title.split(s)[0]);
             if (title.includes('Mercado Livre') && document.title.length < 20) title = '';
+            
+            // Fix específico se o título vier como "AliExpress" genérico
+            if (title.trim() === 'AliExpress' || title.trim() === 'Aliexpress') {
+                 // Tenta pegar do H1 de novo ou deixa vazio para o backend tratar
+                 const h1 = document.querySelector('h1')?.innerText;
+                 if (h1 && h1.length > 15) title = h1;
+            }
         }
 
         if (!price) {
