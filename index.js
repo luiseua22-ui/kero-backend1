@@ -367,6 +367,60 @@ async function scrapeProduct(rawUrl) {
         let price = null;
         let image = '';
 
+        // ------------------ ALIEXPRESS LOGIC (PRIORIDADE ALTA) ------------------
+        if (window.location.hostname.includes('aliexpress')) {
+            // 1. TÍTULO
+            // Tenta pegar o título do OpenGraph primeiro, geralmente é o melhor e mais limpo
+            const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content');
+            if (ogTitle && !ogTitle.toLowerCase().includes('aliexpress')) {
+                title = ogTitle;
+            }
+
+            // Se falhar ou for genérico, tenta H1 específico
+            if (!title || title.toLowerCase().trim() === 'aliexpress') {
+                const h1 = document.querySelector('h1[data-pl="product-title"]');
+                if (h1) title = h1.innerText;
+            }
+            
+            // Última tentativa de título: Seletor de classe comum
+            if (!title || title.toLowerCase().trim() === 'aliexpress') {
+                 const classTitle = document.querySelector('.product-title-text');
+                 if (classTitle) title = classTitle.innerText;
+            }
+
+            // 2. PREÇO
+            // Tenta pegar preço do OpenGraph/Product meta (Geralmente "406.49")
+            const ogPrice = document.querySelector('meta[property="product:price:amount"]')?.getAttribute('content');
+            const ogCurrency = document.querySelector('meta[property="product:price:currency"]')?.getAttribute('content'); // "BRL"
+            
+            if (ogPrice) {
+                // Formata manualmente se achou nos metas
+                const currencySymbol = (ogCurrency === 'BRL') ? 'R$' : (ogCurrency || '$');
+                price = `${currencySymbol} ${ogPrice.replace('.', ',')}`;
+            }
+
+            // Se falhar, busca no DOM visual (pode falhar se o site mudar classes)
+            if (!price) {
+                const priceEl = document.querySelector('.product-price-value') || 
+                                document.querySelector('.current-price-text') ||
+                                document.querySelector('.price--currentPriceText--V8_y_b5') ||
+                                document.querySelector('[class*="currentPriceText"]');
+                if (priceEl) price = priceEl.innerText;
+            }
+            
+            // Fallback para imagem no AliExpress
+            if (!image) {
+                image = document.querySelector('meta[property="og:image"]')?.getAttribute('content');
+            }
+            
+            // Se já temos título e preço, retorna cedo para evitar ser sobrescrito
+            if (title && price) {
+                return { title, price, image };
+            }
+        }
+        // -----------------------------------------------------------------------
+
+
         // 1. TENTATIVA VIA JSON-LD (DADOS ESTRUTURADOS) - MAIS CONFIÁVEL PARA AMAZON
         const scripts = document.querySelectorAll('script[type="application/ld+json"]');
         for (const script of scripts) {
@@ -399,28 +453,6 @@ async function scrapeProduct(rawUrl) {
                 // Se achou tudo, para.
                 if (title && price && image) break;
             } catch(e) {}
-        }
-
-        // 1.5. SELETORES ESPECÍFICOS ALIEXPRESS
-        if (window.location.hostname.includes('aliexpress')) {
-            // Título
-            const aliTitle = document.querySelector('h1[data-pl="product-title"]')?.innerText || 
-                             document.querySelector('.product-title-text')?.innerText ||
-                             document.querySelector('h1')?.innerText;
-            if (aliTitle) title = aliTitle;
-
-            // Preço
-            const aliPrice = document.querySelector('.product-price-value')?.innerText || // Mobile/App view sometimes
-                             document.querySelector('.current-price-text')?.innerText || // Old Desktop
-                             document.querySelector('.price--currentPriceText--V8_y_b5')?.innerText || // New Dynamic
-                             document.querySelector('[class*="price--currentPriceText"]')?.innerText; // Regex style class match
-            
-            if (aliPrice) price = aliPrice;
-            
-            // Imagem - tentar garantir a melhor
-            const aliImg = document.querySelector('.pdp-main-image img')?.src ||
-                           document.querySelector('.magnifier-image')?.src;
-            if (aliImg) image = aliImg;
         }
 
         // 2. SELETORES ESPECÍFICOS AMAZON (Se JSON-LD falhou)
@@ -456,7 +488,7 @@ async function scrapeProduct(rawUrl) {
             }
         }
 
-        // 3. FALLBACK GENÉRICO (OUTROS SITES)
+        // 3. FALLBACK GENÉRICO (OUTROS SITES, SE NÃO CAIU NO IF DO ALIEXPRESS ACIMA)
         if (!title) {
             title = document.querySelector('h1')?.innerText?.trim() || 
                     document.querySelector('meta[property="og:title"]')?.getAttribute('content') ||
@@ -469,8 +501,8 @@ async function scrapeProduct(rawUrl) {
             storeSuffixes.forEach(s => title = title.split(s)[0]);
             if (title.includes('Mercado Livre') && document.title.length < 20) title = '';
             
-            // Fix específico se o título vier como "AliExpress" genérico
-            if (title.trim() === 'AliExpress' || title.trim() === 'Aliexpress') {
+            // Fix específico se o título ainda for "AliExpress" genérico
+            if (title.toLowerCase().trim() === 'aliexpress') {
                  // Tenta pegar do H1 de novo ou deixa vazio para o backend tratar
                  const h1 = document.querySelector('h1')?.innerText;
                  if (h1 && h1.length > 15) title = h1;
@@ -514,7 +546,10 @@ async function scrapeProduct(rawUrl) {
       let formattedPrice = data.price;
       if (formattedPrice) {
           formattedPrice = String(formattedPrice).replace(/\s+/g, ' ').replace('R$', '').trim();
-          formattedPrice = `R$ ${formattedPrice}`;
+          // Se o preço for apenas numérico (ex: "406.49"), adiciona o R$
+          if (!formattedPrice.includes('$') && !formattedPrice.match(/[A-Z]{3}/)) {
+             formattedPrice = `R$ ${formattedPrice}`;
+          }
       }
 
       return {
