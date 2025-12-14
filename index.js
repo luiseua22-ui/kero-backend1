@@ -366,40 +366,77 @@ async function scrapeProduct(rawUrl) {
         let title = '';
         let price = null;
         let image = '';
+        const hostname = window.location.hostname;
 
-        // ------------------ ALIEXPRESS LOGIC (PRIORIDADE ALTA) ------------------
-        if (window.location.hostname.includes('aliexpress')) {
+        // ------------------ SHEIN LOGIC ------------------
+        if (hostname.includes('shein')) {
             // 1. TÍTULO
-            // Tenta pegar o título do OpenGraph primeiro, geralmente é o melhor e mais limpo
+            // Tenta H1 principal (desktop e mobile)
+            const h1 = document.querySelector('.goods-name__txt, .product-intro__head-name, h1.goods-title-info');
+            if (h1) title = h1.innerText;
+            if (!title) title = document.querySelector('meta[property="og:title"]')?.getAttribute('content');
+
+            // 2. PREÇO (Shein é chata com preço)
+            // Tenta meta tags primeiro
+            const metaPrice = document.querySelector('meta[property="product:price:amount"]')?.getAttribute('content');
+            const metaCurrency = document.querySelector('meta[property="product:price:currency"]')?.getAttribute('content') || 'R$';
+            if (metaPrice) {
+                 price = `${metaCurrency} ${metaPrice}`;
+            }
+
+            // Seletores visuais de preço (com desconto ou original)
+            if (!price) {
+                const priceEl = document.querySelector('.product-intro__head-price .discount') || 
+                                document.querySelector('.goods-price__new') || 
+                                document.querySelector('.from') || 
+                                document.querySelector('.product-intro__head-price .original');
+                if (priceEl) price = priceEl.innerText;
+            }
+
+            // 3. IMAGEM
+            const metaImg = document.querySelector('meta[property="og:image"]')?.getAttribute('content');
+            if (metaImg) image = metaImg;
+            
+            if (!image) {
+               // Imagem principal do produto
+               const imgEl = document.querySelector('.crop-image-container img') || 
+                             document.querySelector('.product-intro__main img');
+               if (imgEl) image = imgEl.src;
+            }
+
+            // Limpeza rápida da imagem da Shein (remove sufixos de tamanho pequeno se possível)
+            if (image && image.includes('_thumbnail_')) {
+               image = image.replace('_thumbnail_', '');
+            }
+
+            if (title) return { title, price, image };
+        }
+
+        // ------------------ ALIEXPRESS LOGIC ------------------
+        if (hostname.includes('aliexpress')) {
             const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content');
             if (ogTitle && !ogTitle.toLowerCase().includes('aliexpress')) {
                 title = ogTitle;
             }
 
-            // Se falhar ou for genérico, tenta H1 específico
             if (!title || title.toLowerCase().trim() === 'aliexpress') {
                 const h1 = document.querySelector('h1[data-pl="product-title"]');
                 if (h1) title = h1.innerText;
             }
             
-            // Última tentativa de título: Seletor de classe comum
             if (!title || title.toLowerCase().trim() === 'aliexpress') {
                  const classTitle = document.querySelector('.product-title-text');
                  if (classTitle) title = classTitle.innerText;
             }
 
-            // 2. PREÇO
-            // Tenta pegar preço do OpenGraph/Product meta (Geralmente "406.49")
             const ogPrice = document.querySelector('meta[property="product:price:amount"]')?.getAttribute('content');
-            const ogCurrency = document.querySelector('meta[property="product:price:currency"]')?.getAttribute('content'); // "BRL"
+            const ogCurrency = document.querySelector('meta[property="product:price:currency"]')?.getAttribute('content'); 
             
             if (ogPrice) {
-                // Formata manualmente se achou nos metas
                 const currencySymbol = (ogCurrency === 'BRL') ? 'R$' : (ogCurrency || '$');
                 price = `${currencySymbol} ${ogPrice.replace('.', ',')}`;
             }
 
-            // Se falhar, busca no DOM visual (pode falhar se o site mudar classes)
             if (!price) {
                 const priceEl = document.querySelector('.product-price-value') || 
                                 document.querySelector('.current-price-text') ||
@@ -408,18 +445,14 @@ async function scrapeProduct(rawUrl) {
                 if (priceEl) price = priceEl.innerText;
             }
             
-            // Fallback para imagem no AliExpress
             if (!image) {
                 image = document.querySelector('meta[property="og:image"]')?.getAttribute('content');
             }
             
-            // Se já temos título e preço, retorna cedo para evitar ser sobrescrito
             if (title && price) {
                 return { title, price, image };
             }
         }
-        // -----------------------------------------------------------------------
-
 
         // 1. TENTATIVA VIA JSON-LD (DADOS ESTRUTURADOS) - MAIS CONFIÁVEL PARA AMAZON
         const scripts = document.querySelectorAll('script[type="application/ld+json"]');
@@ -456,7 +489,7 @@ async function scrapeProduct(rawUrl) {
         }
 
         // 2. SELETORES ESPECÍFICOS AMAZON (Se JSON-LD falhou)
-        if (window.location.hostname.includes('amazon')) {
+        if (hostname.includes('amazon')) {
             if (!title) {
                 // IDs clássicos da Amazon
                 const amzTitle = document.getElementById('productTitle')?.innerText?.trim();
@@ -488,7 +521,7 @@ async function scrapeProduct(rawUrl) {
             }
         }
 
-        // 3. FALLBACK GENÉRICO (OUTROS SITES, SE NÃO CAIU NO IF DO ALIEXPRESS ACIMA)
+        // 3. FALLBACK GENÉRICO (OUTROS SITES, SE NÃO CAIU NOS IFS ESPECÍFICOS ACIMA)
         if (!title) {
             title = document.querySelector('h1')?.innerText?.trim() || 
                     document.querySelector('meta[property="og:title"]')?.getAttribute('content') ||
@@ -497,13 +530,11 @@ async function scrapeProduct(rawUrl) {
         
         // Limpeza de título
         if (title) {
-            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee', ' | AliExpress'];
+            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee', ' | AliExpress', ' | SHEIN', ' - SHEIN Brasil'];
             storeSuffixes.forEach(s => title = title.split(s)[0]);
             if (title.includes('Mercado Livre') && document.title.length < 20) title = '';
             
-            // Fix específico se o título ainda for "AliExpress" genérico
             if (title.toLowerCase().trim() === 'aliexpress') {
-                 // Tenta pegar do H1 de novo ou deixa vazio para o backend tratar
                  const h1 = document.querySelector('h1')?.innerText;
                  if (h1 && h1.length > 15) title = h1;
             }
@@ -518,7 +549,7 @@ async function scrapeProduct(rawUrl) {
         }
 
         if (!price) {
-            const priceSelectors = ['.a-price-whole', '.andes-money-amount__fraction', '[data-testid="price-value"]', '.price'];
+            const priceSelectors = ['.a-price-whole', '.andes-money-amount__fraction', '[data-testid="price-value"]', '.price', '.current-price'];
             for (const sel of priceSelectors) {
                 const el = document.querySelector(sel);
                 if (el && el.innerText.match(/\d/)) {
