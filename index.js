@@ -186,6 +186,13 @@ async function scrapeProduct(rawUrl) {
       if (!rawUrl || typeof rawUrl !== 'string') return { success: false, error: "URL inválida" };
       let url = rawUrl.trim();
       if (!url.startsWith('http')) url = 'https://' + url;
+
+      // TRUQUE SHEIN: CONVERTER MOBILE PARA DESKTOP
+      // m.shein.com é difícil de ler. www.shein.com é melhor.
+      if (url.includes('m.shein.com')) {
+          url = url.replace('m.shein.com', 'www.shein.com');
+      }
+
       let monetizedUrl = generateAffiliateLink(url);
 
       browser = await puppeteer.launch({
@@ -218,16 +225,54 @@ async function scrapeProduct(rawUrl) {
         let res = { title: '', price: '', image: '' };
         const hostname = window.location.hostname;
 
-        // ESTRATÉGIA 1: SELETORES ESPECÍFICOS (SHEIN, AMAZON, ETC)
+        // --- LÓGICA ESPECIAL SHEIN: EXTRAÇÃO DE VARIÁVEIS GLOBAIS ---
         if (hostname.includes('shein')) {
-             const h1 = document.querySelector('.goods-name__txt, .product-intro__head-name, h1.goods-title-info, .detail-title-text');
-             if (h1) res.title = h1.innerText;
-             
-             const img = document.querySelector('.crop-image-container img, .product-intro__main img, .swiper-slide-active img');
-             if (img) res.image = img.src;
+            // Tentativa 1: Variáveis Globais (Memória JS) - A fonte mais confiável
+            try {
+                // gbProductIntroData é a variável padrão da Shein para dados do produto
+                const possibleVars = ['gbProductIntroData', 'productIntroData', 'goodsInfo', 'renderData'];
+                
+                for (const v of possibleVars) {
+                    if (window[v]) {
+                        const data = window[v];
+                        // Estruturas variam: às vezes é data.detail, às vezes é direto
+                        const detail = data.detail || data;
+                        
+                        // Título
+                        if (detail.goods_name) res.title = detail.goods_name;
+                        
+                        // Preço
+                        if (detail.sale_price && detail.sale_price.amount_with_symbol) {
+                            res.price = detail.sale_price.amount_with_symbol;
+                        } else if (detail.retailPrice && detail.retailPrice.amountWithSymbol) {
+                            res.price = detail.retailPrice.amountWithSymbol;
+                        }
+                        
+                        // Imagem
+                        if (detail.original_img) {
+                             res.image = detail.original_img;
+                        } else if (detail.goods_imgs && detail.goods_imgs.main_image) {
+                             res.image = detail.goods_imgs.main_image.origin_image || detail.goods_imgs.main_image.image_url;
+                        }
 
-             const priceEl = document.querySelector('.product-intro__head-price .discount, .goods-price__new, .product-intro__head-price .original, .detail-price-text, .original-price');
-             if (priceEl) res.price = priceEl.innerText;
+                        if (res.title) break; // Se achou título, provavelmente achou o resto
+                    }
+                }
+            } catch(e) {}
+            
+            // Tentativa 2: Seletores de DOM (Desktop & Mobile)
+            if (!res.title) {
+                 const h1 = document.querySelector('.goods-name__txt, .product-intro__head-name, h1.goods-title-info, .detail-title-text, .goods-name, .S-product-intro__head-name');
+                 if (h1) res.title = h1.innerText;
+            }
+            if (!res.price) {
+                 const priceEl = document.querySelector('.product-intro__head-price .discount, .goods-price__new, .product-intro__head-price .original, .detail-price-text, .original-price, .price-estimate, .from');
+                 if (priceEl) res.price = priceEl.innerText;
+            }
+            if (!res.image) {
+                 const img = document.querySelector('.crop-image-container img, .product-intro__main img, .swiper-slide-active img, .j-first-img');
+                 if (img) res.image = img.src;
+            }
         }
         else if (hostname.includes('aliexpress')) {
             const h1 = document.querySelector('h1[data-pl="product-title"], .product-title-text');
@@ -244,23 +289,21 @@ async function scrapeProduct(rawUrl) {
              if (imgEl) res.image = imgEl.src;
         }
 
-        // ESTRATÉGIA 2: JSON-LD (Fallback poderoso para preço/imagem)
-        // O código continua executando isso mesmo se achou algo acima, para preencher lacunas.
+        // --- FALLBACKS GERAIS (JSON-LD & META TAGS) ---
+        
+        // JSON-LD
         const scripts = document.querySelectorAll('script[type="application/ld+json"]');
         for (const script of scripts) {
             try {
                 const json = JSON.parse(script.innerText);
                 const entities = Array.isArray(json) ? json : (json['@graph'] || [json]);
-                
                 for (const entity of entities) {
                     if (entity['@type'] === 'Product' || entity['@type'] === 'ProductGroup') {
                         if (!res.title && entity.name) res.title = entity.name;
-                        
                         if (!res.image && entity.image) {
                             res.image = Array.isArray(entity.image) ? entity.image[0] : entity.image;
                             if (typeof res.image === 'object' && res.image.url) res.image = res.image.url;
                         }
-
                         if (!res.price && entity.offers) {
                             const offers = Array.isArray(entity.offers) ? entity.offers : [entity.offers];
                             const offer = offers.find(o => o.price) || offers[0];
@@ -274,7 +317,7 @@ async function scrapeProduct(rawUrl) {
             } catch(e) {}
         }
 
-        // ESTRATÉGIA 3: META TAGS (Fallback final)
+        // Meta Tags
         if (!res.title) res.title = document.querySelector('meta[property="og:title"]')?.getAttribute('content') || document.title;
         if (!res.image) res.image = document.querySelector('meta[property="og:image"]')?.getAttribute('content');
         if (!res.price) {
@@ -283,7 +326,7 @@ async function scrapeProduct(rawUrl) {
             if (ogPrice) res.price = (ogCurrency || 'R$') + ' ' + ogPrice;
         }
 
-        // LIMPEZA
+        // Limpeza
         if (res.title) {
             const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee', ' | AliExpress', ' | SHEIN', ' - SHEIN Brasil'];
             storeSuffixes.forEach(s => res.title = res.title.split(s)[0]);
@@ -293,6 +336,10 @@ async function scrapeProduct(rawUrl) {
         // Correção de thumbnails da Shein
         if (res.image && res.image.includes('shein') && res.image.includes('_thumbnail_')) {
              res.image = res.image.replace('_thumbnail_', '');
+        }
+        // Correção de imagens com protocolo //
+        if (res.image && res.image.startsWith('//')) {
+             res.image = 'https:' + res.image;
         }
 
         return res;
