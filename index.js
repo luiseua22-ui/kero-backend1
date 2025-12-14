@@ -23,7 +23,7 @@ const queue = new PQueue({
   timeout: 60000 
 });
 
-const DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
+const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
 
 // ---------------- AFILIADOS ----------------
 
@@ -187,99 +187,160 @@ async function scrapeProduct(rawUrl) {
       let url = rawUrl.trim();
       if (!url.startsWith('http')) url = 'https://' + url;
 
-      // TRUQUE SHEIN: CONVERTER MOBILE PARA DESKTOP
-      // m.shein.com é difícil de ler. www.shein.com é melhor.
-      if (url.includes('m.shein.com')) {
-          url = url.replace('m.shein.com', 'www.shein.com');
+      // CONVERSÃO E LIMPEZA DE URL SHEIN
+      if (url.includes('shein.com')) {
+          // Remove parâmetros inúteis que atrapalham o scraping
+          try {
+              const u = new URL(url);
+              // m.shein -> www.shein
+              if (u.hostname === 'm.shein.com') {
+                  u.hostname = 'www.shein.com';
+              }
+              // Manter apenas ID se possível, ou params essenciais
+              const keepParams = ['goods_id', 'id']; 
+              const newParams = new URLSearchParams();
+              u.searchParams.forEach((val, key) => {
+                 if (key.includes('id') || keepParams.includes(key)) {
+                     newParams.set(key, val);
+                 }
+              });
+              // Se tiver algo como /p-12345.html, o ID já está na URL
+              url = u.toString();
+          } catch(e) {}
       }
 
       let monetizedUrl = generateAffiliateLink(url);
 
       browser = await puppeteer.launch({
         headless: "new",
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1920,1080"]
+        args: [
+            "--no-sandbox", 
+            "--disable-setuid-sandbox", 
+            "--window-size=1920,1080",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--blink-settings=imagesEnabled=true"
+        ]
       });
 
       const page = await browser.newPage();
-      await page.setUserAgent(DEFAULT_USER_AGENT);
+      
+      // USER AGENT DE DESKTOP É ESSENCIAL PARA SHEIN
+      await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
+      
       await page.setExtraHTTPHeaders({ 
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Upgrade-Insecure-Requests": "1"
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "no-cache"
       });
       
-      await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+      // Bloqueia recursos inúteis para acelerar e evitar detecção
+      await page.setRequestInterception(true);
+      page.on('request', (req) => {
+        const rType = req.resourceType();
+        if (['font', 'media', 'websocket'].includes(rType)) {
+          req.abort();
+        } else {
+          req.continue();
+        }
+      });
+
+      // Timeout maior para Shein
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
       
+      // Pega HTML bruto para Regex Mining (Mais confiável que DOM)
+      const content = await page.content();
       const pageUrl = page.url();
       let finalUrl = pageUrl;
-      
-      if (pageUrl.includes('/gz/account-verification') || pageUrl.includes('/login')) {
-         try {
-             const goParam = new URL(pageUrl).searchParams.get('go');
-             if (goParam) finalUrl = decodeURIComponent(goParam);
-         } catch (e) { finalUrl = url; }
+
+      // ------------------ SHEIN REGEX MINING ------------------
+      if (url.includes('shein.com') || pageUrl.includes('shein.com')) {
+          let title, price, image;
+
+          // 1. Título via Regex
+          // Procura por "goods_name":"..." ou <title>...</title>
+          const titleMatch = content.match(/"goods_name"\s*:\s*"(.*?)"/) || 
+                             content.match(/<h1[^>]*class="[^"]*product-intro__head-name[^"]*"[^>]*>(.*?)<\/h1>/) ||
+                             content.match(/<title>(.*?)<\/title>/);
+          if (titleMatch) title = titleMatch[1];
+
+          // 2. Imagem via Regex
+          // Procura por "original_img":"..." ou "main_image": "..."
+          const imgMatch = content.match(/"original_img"\s*:\s*"(.*?)"/) || 
+                           content.match(/"main_image"\s*:\s*\{\s*"origin_image"\s*:\s*"(.*?)"/) ||
+                           content.match(/property="og:image"\s+content="(.*?)"/);
+          
+          if (imgMatch) {
+              image = imgMatch[1];
+              // Limpeza comum da Shein
+              if (image.startsWith('//')) image = 'https:' + image;
+              image = image.replace(/_thumbnail_\d+x\d+/, ''); // Pega full resolution
+              image = image.replace(/_220x293/, ''); 
+          }
+
+          // 3. Preço via Regex
+          // Procura por "salePrice":{"amount":"..."} ou "retailPrice"
+          const priceMatch = content.match(/"salePrice"\s*:\s*\{\s*"amount"\s*:\s*"(\d+\.?\d*)"/) || 
+                             content.match(/"retailPrice"\s*:\s*\{\s*"amount"\s*:\s*"(\d+\.?\d*)"/) ||
+                             content.match(/"amountWithSymbol"\s*:\s*"(.*?)"/);
+          
+          if (priceMatch) {
+             price = priceMatch[1];
+             if (!price.includes('R$') && !price.includes('$')) {
+                 price = `R$ ${price}`;
+             }
+          }
+
+          // Fallback final no DOM se regex falhar
+          if (!title || !price) {
+             const domData = await page.evaluate(() => {
+                 let t, p, i;
+                 // Título
+                 t = document.querySelector('h1.goods-name__txt')?.innerText || document.title;
+                 // Preço
+                 p = document.querySelector('.product-intro__head-price .discount')?.innerText || 
+                     document.querySelector('.product-intro__head-price .original')?.innerText;
+                 // Imagem
+                 i = document.querySelector('.crop-image-container img')?.src;
+                 return { t, p, i };
+             });
+             if (!title) title = domData.t;
+             if (!price) price = domData.p;
+             if (!image) image = domData.i;
+          }
+
+          // Limpeza final do Título
+          if (title) {
+              title = title.split('|')[0].split('- SHEIN')[0].trim();
+              // Decode HTML entities simples se houver
+              title = title.replace(/&amp;/g, '&');
+          }
+
+          await browser.close();
+
+          return {
+              success: true,
+              url: finalUrl,
+              monetized_url: monetizedUrl,
+              title: title || 'Produto Shein',
+              price: price || '',
+              image: image || ''
+          };
       }
 
-      if (finalUrl !== url) monetizedUrl = generateAffiliateLink(finalUrl);
+      // ------------------ OUTROS SITES (LÓGICA PADRÃO) ------------------
 
       const data = await page.evaluate(() => {
         let res = { title: '', price: '', image: '' };
         const hostname = window.location.hostname;
 
-        // --- LÓGICA ESPECIAL SHEIN: EXTRAÇÃO DE VARIÁVEIS GLOBAIS ---
-        if (hostname.includes('shein')) {
-            // Tentativa 1: Variáveis Globais (Memória JS) - A fonte mais confiável
-            try {
-                // gbProductIntroData é a variável padrão da Shein para dados do produto
-                const possibleVars = ['gbProductIntroData', 'productIntroData', 'goodsInfo', 'renderData'];
-                
-                for (const v of possibleVars) {
-                    if (window[v]) {
-                        const data = window[v];
-                        // Estruturas variam: às vezes é data.detail, às vezes é direto
-                        const detail = data.detail || data;
-                        
-                        // Título
-                        if (detail.goods_name) res.title = detail.goods_name;
-                        
-                        // Preço
-                        if (detail.sale_price && detail.sale_price.amount_with_symbol) {
-                            res.price = detail.sale_price.amount_with_symbol;
-                        } else if (detail.retailPrice && detail.retailPrice.amountWithSymbol) {
-                            res.price = detail.retailPrice.amountWithSymbol;
-                        }
-                        
-                        // Imagem
-                        if (detail.original_img) {
-                             res.image = detail.original_img;
-                        } else if (detail.goods_imgs && detail.goods_imgs.main_image) {
-                             res.image = detail.goods_imgs.main_image.origin_image || detail.goods_imgs.main_image.image_url;
-                        }
-
-                        if (res.title) break; // Se achou título, provavelmente achou o resto
-                    }
-                }
-            } catch(e) {}
-            
-            // Tentativa 2: Seletores de DOM (Desktop & Mobile)
-            if (!res.title) {
-                 const h1 = document.querySelector('.goods-name__txt, .product-intro__head-name, h1.goods-title-info, .detail-title-text, .goods-name, .S-product-intro__head-name');
-                 if (h1) res.title = h1.innerText;
-            }
-            if (!res.price) {
-                 const priceEl = document.querySelector('.product-intro__head-price .discount, .goods-price__new, .product-intro__head-price .original, .detail-price-text, .original-price, .price-estimate, .from');
-                 if (priceEl) res.price = priceEl.innerText;
-            }
-            if (!res.image) {
-                 const img = document.querySelector('.crop-image-container img, .product-intro__main img, .swiper-slide-active img, .j-first-img');
-                 if (img) res.image = img.src;
-            }
-        }
-        else if (hostname.includes('aliexpress')) {
+        // ALIEXPRESS
+        if (hostname.includes('aliexpress')) {
             const h1 = document.querySelector('h1[data-pl="product-title"], .product-title-text');
             if (h1) res.title = h1.innerText;
-            const priceEl = document.querySelector('.product-price-value, .current-price-text, .price--currentPriceText--V8_y_b5');
+            const priceEl = document.querySelector('.product-price-value, .current-price-text');
             if (priceEl) res.price = priceEl.innerText;
         }
+        // AMAZON
         else if (hostname.includes('amazon')) {
              const titleEl = document.getElementById('productTitle');
              if (titleEl) res.title = titleEl.innerText;
@@ -289,9 +350,7 @@ async function scrapeProduct(rawUrl) {
              if (imgEl) res.image = imgEl.src;
         }
 
-        // --- FALLBACKS GERAIS (JSON-LD & META TAGS) ---
-        
-        // JSON-LD
+        // JSON-LD FALLBACK
         const scripts = document.querySelectorAll('script[type="application/ld+json"]');
         for (const script of scripts) {
             try {
@@ -317,7 +376,7 @@ async function scrapeProduct(rawUrl) {
             } catch(e) {}
         }
 
-        // Meta Tags
+        // META TAGS FALLBACK
         if (!res.title) res.title = document.querySelector('meta[property="og:title"]')?.getAttribute('content') || document.title;
         if (!res.image) res.image = document.querySelector('meta[property="og:image"]')?.getAttribute('content');
         if (!res.price) {
@@ -326,18 +385,13 @@ async function scrapeProduct(rawUrl) {
             if (ogPrice) res.price = (ogCurrency || 'R$') + ' ' + ogPrice;
         }
 
-        // Limpeza
         if (res.title) {
-            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee', ' | AliExpress', ' | SHEIN', ' - SHEIN Brasil'];
+            const storeSuffixes = [' | Mercado Livre', ' - Mercado Livre', ' | Amazon', ' - Magalu', ' | Magazine Luiza', ' | Shopee', ' | AliExpress'];
             storeSuffixes.forEach(s => res.title = res.title.split(s)[0]);
             res.title = res.title.trim();
         }
-
-        // Correção de thumbnails da Shein
-        if (res.image && res.image.includes('shein') && res.image.includes('_thumbnail_')) {
-             res.image = res.image.replace('_thumbnail_', '');
-        }
-        // Correção de imagens com protocolo //
+        
+        // Fix protocol relative URLs
         if (res.image && res.image.startsWith('//')) {
              res.image = 'https:' + res.image;
         }
